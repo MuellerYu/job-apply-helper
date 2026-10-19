@@ -4,7 +4,8 @@
 const WDAF_DEFAULT_PROFILE = {
   // 基本信息
   firstName: '', middleName: '', lastName: '',
-  preferredName: '', // 常用名（英文名等）：填了就用在 Preferred / Nickname 题上，空着就不填
+  preferredName: '', preferredOnlyIfRequired: '', nativeName: '',
+  interviewAvailability: '', // 面试时间（问「哪些时段能面试」时填的一句话） // nativeName：母语写的全名（如中文汉字），问 Name in Native Language 时用 // 常用名（英文名等）：填了就用在 Preferred / Nickname 题上，空着就不填
   email: '', phone: '', phoneType: 'Mobile', phoneOS: '', // 手机系统（iPhone / Android），电话类型题要分系统时用
   country: 'United States of America',
   address1: '', address2: '', city: '', state: '', postalCode: '',
@@ -43,7 +44,7 @@ const WDAF_DEFAULT_PROFILE = {
   undergradGpa: '', // 本科 GPA（4.0 制），问 undergraduate GPA 时用
   stdTest: '', // 考过的标化考试（SAT / ACT / GMAT / GRE），没考过写 None
   // 自愿披露（EEO）
-  gender: 'DECLINE', hispanic: 'DECLINE', ethnicity: 'DECLINE', sexualOrientation: 'DECLINE',
+  gender: 'DECLINE', hispanic: 'DECLINE', ethnicity: 'DECLINE', sexualOrientation: 'DECLINE', transgender: '',
   veteran: 'DECLINE', disability: 'DECLINE',
 };
 

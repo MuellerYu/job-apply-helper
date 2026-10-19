@@ -5,7 +5,7 @@
   document.querySelectorAll('#wdaf-host').forEach((h) => h.remove());
 
   const AUTO_KEY = 'wdaf-auto-running';
-  const BUILD = '2026-10-19.190'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
+  const BUILD = '2026-10-19.219'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
   let QUEUE = null;
   let QUEUE_SUBMIT = false; // 队列设置：填完自动提交
   const sleep = (ms) => new Promise((r) => {
@@ -29,7 +29,7 @@
     console.log('[自动投递] Workday 页面是', WD_LOCALE[1], '版，换成英文版网址');
     location.replace(location.pathname.replace(/^\/[a-z]{2}-[A-Z]{2}/, '/en-US') + location.search + location.hash);
   }
-  const norm = (s) => String(s || '').toLowerCase().replace(/[’‘]/g, "'").replace(/[ \s]+/g, ' ').replace(/[*✱]/g, '').trim();
+  const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[’‘]/g, "'").replace(/[ \s]+/g, ' ').replace(/[*✱]/g, '').trim();
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   const DECLINE_RE = /decline|not wish|n.t wish|prefer not|choose not|do not want|don.t want|rather not|not to (answer|disclose|self.?identify|provide)/i;
@@ -144,7 +144,7 @@
   }
 
   async function addLog(status) {
-    const url = location.href.replace(/\/apply(\/.*)?$/, '');
+    const url = location.href.split('#')[0].replace(/\/(confirmation|thank-?you|thanks|success)\/?(\?.*)?$/i, '').replace(/\/apply(\/.*)?$/, '');
     const { log = [] } = await chrome.storage.local.get('log');
     const pick = currentPick || (await chooseResume());
     const entry = {
@@ -251,6 +251,11 @@
 
   const GENERIC_Q_RE = /^(please )?(select|choose|make a selection)?( one)?( of)?( the)? ?(options?|selection)?$|^please of the options?$|^(please )?(select|choose) (one|an option)$/i;
   function questionFor(el) {
+    const afi = el.closest && el.closest('.ant-form-item');
+    if (afi) {
+      const al = q('.ant-form-item-label label, .ant-form-item-label', afi);
+      if (al && textOf(al)) return cleanLabel(textOf(al));
+    }
     if (location.hostname === 'docs.google.com') {
       const li = el.closest('[role="listitem"]');
       const hd = li && q('[role="heading"]', li);
@@ -354,6 +359,9 @@
     { re: /i (have|use) a preferred name|use (a |my )?preferred name/, key: 'preferredNameBox', kinds: ['checkbox'] },
     { re: /preferred (first |last |given |family )?name|nickname|local (given|family) name/, key: null },
     { re: /additional information that (could|would|might) be helpful|we don'?t need a cover letter|use the space below to tell us|anything else (you'?d like|we should know)/, key: null, kinds: TEXT },
+    { re: /name.{0,40}(native language|native script|original script|local language|chinese characters|in chinese)|native[- ]language name|name in (your )?native/, key: 'nativeName', kinds: TEXT },
+    { re: /^i (hereby )?(certify|attest|affirm|declare)\b.{0,400}\b(true|accurate|complete|correct)\b/, key: 'SIGN_DATE', kinds: TEXT },
+    { re: /applicant certification|certification and acknowledg|by (typing|entering) (your|my) (full |legal )?name|type your (full |legal )?name (below|here|to)|electronic(ally)? sign/, key: 'FULLNAME', kinds: TEXT },
     { re: /middle name/, key: 'middleName', kinds: TEXT, self: true },
     { re: /first name|given name/, key: 'firstName', kinds: TEXT, self: true },
     { re: /second (last name|surname|family name)|maternal (last name|surname)|apellido/, key: null },
@@ -409,6 +417,7 @@
     { re: /(list|name|enter|provide|what is|which)( the| your)? (name of (the |your )?)?(university|college|school|institution)( you are| you're)? (currently )?(attend|enrolled|studying)|(university|college|school) you are currently attending/, key: 'school', kinds: TEXTISH },
     { re: /class standing|year in school|academic (standing|level|year)/, key: 'classStanding', kinds: TEXT },
     { re: /^(where|at which (school|university|college|institution)|which (school|university|college|institution)) (are|do) you (currently )?(pursu|attend|stud|enrol)/, key: 'school', kinds: TEXTISH },
+    { re: /^(what|which) (college|university|school|institution)( or (college|university|school))? (are|do|will) you (currently |now )?(attend|enrol|stud|pursu)/, key: 'school', kinds: TEXTISH },
     { re: /total military experience|years of (military|active duty) (service|experience)|how (long|many years) (have|did) you serve/, key: 'militaryYears', kinds: [...PICK, 'radio'] },
     { re: /total (relevant )?(professional|work)( or military)? experience|years of (relevant )?(professional|work|full[- ]time) experience/, key: 'yearsExp', kinds: [...PICK, 'radio'] },
     { re: /currently (enrolled|pursuing|a student|attending)|current(ly)? (a )?student|enrolled (in|as)|return(ing)? to (school|your studies|university|college)|still (be )?(in school|a student)/, key: 'enrolled' },
@@ -427,10 +436,15 @@
     { re: /(previously|ever|before) (applied|submitted an application)|applied (to|for|with) .{0,60}(before|previously|in the past)|engaged in (the|a|any) recruit\w* process|interviewed for (a|any) (position|role)|spoken (to|with) anyone about a role/, key: 'previouslyApplied' },
     { re: /actively interviewing|interviewing (with|for) other|(received|have|hold) (an |any )?(other |competing |outstanding )?(job |internship )?offers?\b|competing offers?|offer (deadline|expiration)/, key: 'otherOffers' },
     { re: /recruiting (timelines?|deadlines?)|(timelines?|deadlines?) (we|that we) should (be aware|know)|other (interview|recruiting) (processes|timelines?|deadlines?)|any (upcoming )?(offer )?deadlines?/, key: 'recruitingTimelines' },
-    { re: /^(your )?home ?town\b|where (are you|did you grow up) from|where did you grow up|city of origin/, key: 'hometown', kinds: [...TEXT, ...PICK] },
+    { re: /^(your )?home ?town\b|where (are you|did you grow up) from|where did you grow up|city of origin|(what|where) is your home ?town\b/, key: 'hometown', kinds: [...TEXT, ...PICK] }, // 「What is your hometown or permanent city and state」
     { re: /(year|when) did you graduate (from )?high school|high school (graduation|grad) (year|date)|year of high school graduation/, key: 'hsGradYear' },
     { re: /cpa eligibility (through|via|by)|meet(ing)? (the )?cpa (eligibility|licensure|education)|cpa (licensure |license )?pathway|150[- ]credit/, key: 'cpaPathway', kinds: [...TEXT, ...PICK, 'radio'] },
     { re: /essential functions/, key: 'essentialFunctions' },
+    { re: /availability for interview|interview availability|(available|availability) (to|for) interview|times? (are you|you are) (available|free) (to|for) (an? )?interview/, key: 'interviewAvailability', kinds: TEXT },
+    { re: /month (you|you'?ll) (will )?(be able to|can|could|are able to|plan to) (start|begin)|start(ing)? month|month .{0,25}(start|begin) (your |the )?internship/, key: 'startMonth', kinds: [...PICK, 'radio'] },
+    { re: /(may|can) we contact (your )?(current|present) employer|contact (your )?(current|present) employer/, key: 'contactCurrentEmployer', kinds: [...PICK, 'radio'] },
+    { re: /(do you (currently )?have|have you (already )?(secured|arranged|made|found)|already (have|secured)) (\w+ ){0,2}(housing|accommodation|a place to (live|stay))/, key: 'NO', kinds: [...PICK, 'radio'] },
+    { re: /(willing|able|plan|prepared) to (arrange|secure|find|provide|cover) (for )?(your |my )?own (housing|accommodation|lodging)|responsible for (your |my )?own (housing|accommodation|lodging)/, key: 'YES', kinds: [...PICK, 'radio'] },
     { re: /(willing|agree|consent|able|prepared) to (submit to|undergo|complete|pass|take|participate in)( a| an| the)?( pre-?employment| standard)? (background|criminal|drug|credit)|(background (check|screen\w*|investigation)|drug (test|screen\w*)).{0,40}\b(willing|agree|consent)\b/, key: 'YES', kinds: [...PICK, 'radio'] },
     { re: /meet (all (of )?)?the (minimum|basic|required|stated) (qualifications|requirements)|minimum qualifications/, key: 'essentialFunctions' }, // 是否满足最低任职要求
     { re: /driv(ing|er'?s|ers) licen[cs]e|valid licen[cs]e to drive/, key: 'driversLicense' },
@@ -463,10 +477,12 @@
     { re: /(programming|software|statistical|coding) (tools?|languages?|packages?|software)\b.{0,160}\b(coursework|course ?work|classroom|class(es)? assignments?|courses?\b|academic)/, key: 'toolsCoursework', kinds: TOOL_KINDS },
     { re: /which (programming|software|statistical|coding) (tools?|languages?|packages?)|(programming|software|coding) (tools?|languages?)\b.{0,60}(used|familiar|proficien|experience|know|comfortable)/, key: 'toolsAll', kinds: TOOL_KINDS },
     { re: /^skills?$|^type to add skills/, key: 'skills', kinds: ['prompt'] },
+    { re: /pronoun/, key: 'pronouns', kinds: PICK },
     { re: /^(what is your )?gender\b/, key: 'gender' },
     { re: /^(are you|do you (identify|consider yourself) as)( a)? (hispanic|latino)|^(?!.*(\brace\b|ethnic)).*(hispanic|latino)/, key: 'hispanic' },
     { re: /\braces?\b|ethnicity|ethnic/, key: 'ethnicity' }, // 「Select the races you identify with」（Navy Federal）是复数
     { re: /sexual orientation/, key: 'sexualOrientation' },
+    { re: /transgender/, key: 'transgender', kinds: [...PICK, 'radio'] },
     { re: /transgender/, key: 'transgender' }, // 资料里没有答案 -> 标红让你答一次，之后记住
     { re: /gender|^sex$/, key: 'gender' },
     { re: /(military|armed forces|service ?members?).{0,80}spouses?|disclose your (military|veteran|service) status/, key: 'NONE_ABOVE', kinds: ['checkgroup', 'radio', ...PICK] },
@@ -482,14 +498,18 @@
     { re: /(confidential information|trade secrets?|proprietary information).{0,120}(employer|employment|position)/, key: 'confidentialInfo', kinds: [...PICK, 'radio'] },
     { re: /(require|need|request)\b.{0,30}(reasonable )?accommodation|reasonable accommodation.{0,80}(require|need|request)/, key: 'needAccommodation', kinds: [...PICK, 'radio'] },
     { re: /disabilit/, key: 'disability' },
-    { re: /^(?!.*(marketing|recruiting updates|job (alerts?|opportunit)|new (job )?opportunit|\bsms\b|text messag|newsletter|promotional|talent (community|network|pool)|receive (emails|updates|communications))).*(terms|consent|i agree|acknowledg|certify|attest|i have read)/, key: 'TERMS', kinds: ['checkbox'] },
+    { re: /^(?!.*(marketing|recruiting updates|job (alerts?|opportunit)|new (job )?opportunit|\bsms\b|text messag|newsletter|promotional|talent (community|network|pool)|receive (emails|updates|communications))).*(terms|consent|i agree|acknowledg|certify|attest|i have read|\bi accept\b|privacy (statement|policy|notice))/, key: 'TERMS', kinds: ['checkbox'] }, // 「I accept thePrivacy statement」（ACT Group，链接贴着前面的字）
     { re: /^name$|^your name|full name|signature$/, key: 'FULLNAME', kinds: TEXT, self: true },
   ];
 
   function valueFor(key) {
     const P = S.profile;
     if (key === 'FULLNAME') return [P.firstName, P.lastName].filter(Boolean).join(' ');
+    if (key === 'SIGN_DATE') { const d = new Date(); const nm = [P.firstName, P.lastName].filter(Boolean).join(' '); return nm ? `${nm}, ${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${d.getFullYear()}` : ''; }
     if (key === 'YES') return 'Yes';
+    if (key === 'pronouns') return altsFor('pronouns')[0] || '';
+    if (key === 'startMonth') return altsFor('startMonth')[0] || '';
+    if (key === 'contactCurrentEmployer') return 'N/A';
     if (key === 'hsGradYear') return P.hsGradYear ? String(P.hsGradYear) : '';
     if (key === 'hometown') return P.hometown || '';
     if (key === 'cpaPathway') return P.cpaPathway || '';
@@ -514,7 +534,7 @@
     if (key === 'NONE_ABOVE') return 'None of the above';
     if (key === 'NO') return 'No';
     if (key === 'TERMS') return S.settings.acceptTerms ? 'CHECK' : '';
-    if (key === 'preferredNameBox') return P.preferredName ? 'CHECK' : '';
+    if (key === 'preferredNameBox') return P.preferredName && P.preferredOnlyIfRequired !== 'Yes' ? 'CHECK' : '';
     if (key === 'AUTH_NO_SPONSOR') return P.needSponsorship === 'Yes' ? 'No' : P.workAuthorized;
     if (key === 'skills') return P.skills ? P.skills.split(/[,，;；]/).map((s) => s.trim()).filter(Boolean) : '';
     if (key === 'toolsCoursework' || key === 'toolsWork' || key === 'toolsAll') {
@@ -628,6 +648,9 @@
     if (key === 'visaStatus') return P.f1Status === 'Yes' ? ['F-1', 'F-1 Student', 'F-1 Student Visa', 'F1', 'F-1 Visa', 'Student (F-1)', 'F-1 CPT', 'F-1 (CPT)', 'CPT'] : [];
     if (key === 'cpaPathway') return [P.cpaPathway, 'traditional 150-credit hour pathway', '150-credit hour', '150 credit hour', '150 hours'].filter(Boolean);
     if (key === 'undergradSchool') return [P.undergradSchool, P.undergradSchoolAlt].filter(Boolean);
+    if (key === 'startMonth') { const d = P.availableStart && new Date(P.availableStart); if (!d || isNaN(d)) return []; const m = MONTHS[d.getMonth()]; return [m, m.slice(0, 3), `${m} ${d.getFullYear()}`, String(d.getMonth() + 1).padStart(2, '0'), String(d.getMonth() + 1)]; }
+    if (key === 'contactCurrentEmployer') return ['N/A', 'Not applicable', 'Not currently employed', 'I am not currently employed', 'Yes'];
+    if (key === 'pronouns') { const g = norm(P.gender); return /^(male|man)$/.test(g) ? ['He / Him', 'He/Him', 'He/him', 'He'] : /^(female|woman)$/.test(g) ? ['She / Her', 'She/Her', 'She/her', 'She'] : []; }
     if (key === 'undergradMajor') return [P.undergradMajor, ...String(P.undergradMajorAlt || '').split(/[,;，；]/).map((x) => x.trim())].filter(Boolean);
     if (key === 'recruitingTimelines') return S.profile.otherOffers === 'No' ? ['No', 'None', 'Not at this time', 'N/A'] : [];
     if (key === 'gradDate') return gradDateCands();
@@ -704,6 +727,15 @@
         return { key: 'fullTimeBy', value: grad < Number(ft[5]) * 12 + mi + 1 ? 'Yes' : 'No' };
       }
     }
+    const resid = kind !== 'text' && nq.match(/\b(are you|do you) (currently )?(a )?(resident of|reside in|live in|living in) (the (state|commonwealth) of )?([a-z][a-z .]{2,30}?)(?= and\b| or\b|[?,.]|$)/);
+    if (resid && S.profile.state && !/united states|\bu\.?s\.?a?\b|america|the us\b|this (state|area|country)/.test(resid[7])) {
+      const place = resid[7].trim();
+      const mine = [S.profile.state, S.profile.city].map(norm).filter(Boolean);
+      return { key: 'residentOf', value: mine.some((m) => place.includes(m) || m.includes(place)) ? 'Yes' : 'No' };
+    }
+    const gpaT = kind !== 'text' && /\b(gpa|grade point average)\b/.test(nq) && !/undergrad/.test(nq)
+      && (nq.match(/(\d\.\d{1,2})\s*(\/\s*4(\.0)?\s*)?(or (higher|above|greater|better|more)|and (above|higher|up)|\+)/) || nq.match(/(?:at least|minimum(?: of)?|above|over|greater than|exceed\w*)\s*(?:a )?(\d\.\d{1,2})/));
+    if (gpaT && parseFloat(S.profile.gpa)) return { key: 'gpaThreshold', value: parseFloat(S.profile.gpa) >= parseFloat(gpaT[1]) ? 'Yes' : 'No' };
     const yrs = kind !== 'text' && nq.match(/^(do|does|have) you (have|possess)\b.{0,30}?(\d+)\s*\+?\s*(or more |plus )?years?\b.{0,80}experience/);
     if (yrs) return { key: 'yearsExp', value: fullTimeYears() >= Number(yrs[3]) ? 'Yes' : 'No' };
     if (S.profile.source && /^if ["“']?(job (posting|board|site)|online job|internet|website)s?\b["”']?.{0,40}(specify|which|name)/.test(nq)) {
@@ -721,6 +753,11 @@
       if (r.re.test(nq)) {
         const alts = r.key && altsFor(r.key);
         const ans = { key: r.key, value: r.key ? valueFor(r.key) : '', alts: alts && alts.length ? alts : null, first: !!r.first };
+        if (r.key === 'preferredName') {
+          const req = !!(f && isRequired(f));
+          if (S.profile.preferredOnlyIfRequired === 'Yes' && !req) ans.value = '';
+          else if (!ans.value && req) ans.value = S.profile.firstName || '';
+        }
         if (r.key === 'otherSchool') { const sch = norm(S.profile.school || ''); ans.value = sch && (nq.includes(sch) || (/new york university/.test(sch) && /\bnyu\b/.test(nq))) ? 'Yes' : 'No'; }
         if (r.key === 'source') ans.fallback = ['Other', 'Other...', 'Others', 'Other (please specify)'];
         if (r.key === 'undergradSchool') ans.fallback = ['Other', 'Other (please specify)', 'Other School', 'Not Listed', 'School not listed'];
@@ -736,7 +773,9 @@
     return null;
   }
 
-  const candsOf = (ans) => (Array.isArray(ans.value) ? ans.value : ans.alts || [ans.value]);
+  const NO_ALTS = ['No', 'I have never', 'Never', 'I have not', 'None'];
+  const YES_ALTS = ['Yes', 'I am willing', 'I agree', 'I am able'];
+  const candsOf = (ans) => (Array.isArray(ans.value) ? ans.value : ans.alts || (/^no$/i.test(String(ans.value || '')) ? NO_ALTS : /^yes$/i.test(String(ans.value || '')) ? YES_ALTS : [ans.value]));
 
   const EDU_KEYS = new Set(['school', 'degree', 'fieldOfStudy', 'gpa']);
   const ADDRESS_KEYS = new Set(['address1', 'address2', 'city', 'state', 'postalCode', 'cityLoc']);
@@ -901,6 +940,9 @@
     const groups = new Map();
     for (const el of qa('input, textarea, select, button[aria-haspopup="listbox"]', scope)) {
       if (el.closest('#wdaf-host') || el.disabled) continue;
+      if (el.tagName === 'INPUT' && el.getAttribute('role') !== 'combobox' && !el.closest('.ant-select')
+        && (el.type === 'search' || /^search\b/i.test(el.placeholder || el.getAttribute('aria-label') || '') || /(^|[-_])(q|query|search|keywords?)($|[-_])/i.test(el.name || el.id || ''))) continue;
+      if (el.closest('nav, [role="navigation"], header, [role="banner"], footer, [role="contentinfo"], [role="search"]') && !el.closest('form [id*="app" i], form[id*="app" i], #application, [data-qa="application"]')) continue;
       if (/^(other response|其他回复)$/i.test(el.getAttribute('aria-label') || '')) {
         const li = el.closest('[role="listitem"]');
         if (!li || !q('[data-value="__other_option__"][aria-checked="true"]', li)) continue;
@@ -912,7 +954,8 @@
         continue;
       }
       const choice = el.type === 'radio' || el.type === 'checkbox';
-      if (!(isVisible(el) || (choice && ([...(el.labels || [])].some(isVisible) || isVisible(el.parentElement))))) continue;
+      const antd = el.tagName === 'INPUT' && el.closest('.ant-select');
+      if (!(isVisible(el) || (antd && isVisible(antd)) || (choice && ([...(el.labels || [])].some(isVisible) || isVisible(el.parentElement))))) continue;
       const aid = el.getAttribute('data-automation-id') || '';
       if (aid === 'beecatcher' || el.getAttribute('aria-hidden') === 'true') continue; // 防机器人的隐藏陷阱框，绝不能填
       if (el.tagName === 'BUTTON') { fields.push({ kind: 'listbox', el }); continue; }
@@ -1031,13 +1074,15 @@
   }
 
   function comboBox(el) {
-    return el.closest('.el-select') || el.closest('[class*="select__control"]') || el.closest('[class*="-control"]') || el.closest('.MuiAutocomplete-root')
+    return el.closest('.ant-select') || el.closest('.el-select') || el.closest('[class*="select__control"]') || el.closest('[class*="-control"]') || el.closest('.MuiAutocomplete-root')
       || el.parentElement?.parentElement || el;
   }
   const elSelectValue = (el) => { const p = q('.el-select__placeholder:not(.is-transparent)', comboBox(el)); return p ? textOf(p) : ''; };
   function comboValue(el) {
     if (el.value.trim()) return el.value.trim();
     if (elSelectValue(el)) return elSelectValue(el);
+    const ant = el.closest('.ant-select') && q('.ant-select-selection-item', el.closest('.ant-select'));
+    if (ant) return ant.getAttribute('title') || textOf(ant);
     const v = q('[class*="single-value"], [class*="singleValue"], [class*="multi-value__label"], [class*="multiValue"], .MuiChip-label, .Select-value-label', comboBox(el));
     return v ? textOf(v) : '';
   }
@@ -1124,12 +1169,35 @@
     }
   }
 
+  const errorRequired = new WeakSet();
+  const REQ_ERR_RE = /^(this field is required|this is a required field|required|field is required|this question is required|please (select|choose|enter|fill( in| out)?|complete|answer|provide) .{0,40})\.?$/i;
+  function markErrorRequired() {
+    const out = [];
+    const fields = collectFields();
+    for (const e of qa('div, span, p, small, li, [role="alert"]')) {
+      if (e.children.length > 1 || !isVisible(e) || e.closest('#wdaf-host') || !REQ_ERR_RE.test(textOf(e))) continue;
+      let box = e.parentElement;
+      for (let i = 0; i < 6 && box; i++, box = box.parentElement) {
+        const file = q('input[type="file"]', box);
+        if (file) { out.push(`上传栏：${cleanLabel(precedingText(fileZone(file)) || fileCtxOwn(file)).slice(0, 40)}`); break; }
+        const upBtn = qa('button, [role="button"]', box).find((b) => UPLOAD_BTN_RE.test(cleanLabel(textOf(b))));
+        if (upBtn) { out.push(`上传栏：${cleanLabel(precedingText(upBtn) || textOf(upBtn)).slice(0, 40)}`); break; }
+        const hit = fields.filter((f) => (f.els || [f.el]).some((x) => box.contains(x)));
+        if (!hit.length) continue;
+        for (const f of hit.slice(0, 3)) { for (const x of f.els || [f.el]) errorRequired.add(x); out.push(f.question); }
+        break;
+      }
+    }
+    return [...new Set(out)];
+  }
   function isRequired(f) {
+    if ((f.els || [f.el]).some((x) => errorRequired.has(x))) return true;
     const ff = f.el.closest('[data-automation-id^="formField"]') || f.el.closest('fieldset');
     if (f.el.getAttribute('aria-required') === 'true' || f.el.required) return true;
     if (f.s2 && f.s2.getAttribute('aria-required') === 'true') return true;
     if (f.kind === 'popcombo' && f.el.parentElement && f.el.parentElement.matches('.required, [aria-required="true"]')) return true; // Jane Street：div.standard-dropdown.required
     if (f.el.classList.contains('required') || [...(f.el.labels || [])].some((l) => l.classList.contains('required'))) return true;
+    if ([...(f.el.labels || [])].some((l) => /(^|[\s_-])required(\s|$)/i.test(l.className)) || q('.ant-form-item-required', f.el.closest('.ant-form-item') || document.createElement('i'))) return true;
     if (/required/i.test(f.el.getAttribute('aria-label') || '')) return true;
     if ([...(f.el.labels || [])].some((l) => /\(required\)/i.test(l.textContent))) return true;
     if ([...(f.el.labels || [])].some((l) => /\*/.test(l.textContent)) && f.kind !== 'radio' && f.kind !== 'checkgroup') return true;
@@ -1352,6 +1420,12 @@
     return std.length ? std : popupOptions(input);
   }
   function comboOptionsStd(input) {
+    if (input.closest('.ant-select')) {
+      const ant = qa('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option').filter(isVisible)
+        .map((el) => ({ el, text: el.getAttribute('title') || textOf(q('.ant-select-item-option-content', el) || el) }))
+        .filter((o) => o.text);
+      if (ant.length) return ant;
+    }
     const id = input.getAttribute('aria-controls') || input.getAttribute('aria-owns');
     const own = id && document.getElementById(id);
     const roots = own && isVisible(own) ? [own] : qa('[role="listbox"]').filter((l) => isVisible(l) && !l.closest('#wdaf-host'));
@@ -1367,7 +1441,7 @@
   }
 
   function comboPicked(input, optText) {
-    if (q('[class*="single-value"], [class*="singleValue"], [class*="multi-value"], [class*="multiValue"], .MuiChip-root, .Select-value-label', comboBox(input))) return true;
+    if (q('[class*="single-value"], [class*="singleValue"], [class*="multi-value"], [class*="multiValue"], .MuiChip-root, .Select-value-label, .ant-select-selection-item', comboBox(input))) return true;
     if (elSelectValue(input) && norm(elSelectValue(input)) === norm(optText)) return true; // el-select 选上后文字在旁边的 span 里
     const stillOpen = input.getAttribute('aria-expanded') === 'true' && qa('[role="listbox"]').some((l) => isVisible(l) && !l.closest('#wdaf-host'));
     if (stillOpen || input.getAttribute('aria-invalid') === 'true') return false;
@@ -1448,7 +1522,18 @@
     const opts = await openCombo(input);
     if (opts.length) {
       const big = opts.length >= 90;
-      const hit = big ? (ans && ans.numeric != null && pickRange(opts, ans.numeric)) || pickAny(opts, cands.slice(0, 1)) : chooseOption(opts, cands, ans);
+      let hit = big ? (ans && ans.numeric != null && pickRange(opts, ans.numeric)) || pickAny(opts, cands.slice(0, 1)) : chooseOption(opts, cands, ans);
+      if (!hit && opts.length === 1 && /^(thank you|thanks|ok(ay)?|i understand|understood|acknowledged?|i acknowledge|noted|i agree|yes,? i (understand|agree|acknowledge))\.?!?$/i.test(opts[0].text.trim())) hit = opts[0];
+      if (!hit && ans && /^(workAuthorized|AUTH_NO_SPONSOR|needSponsorship|sponsorship)$/.test(ans.key || '') && S.profile.needSponsorship === 'Yes') {
+        const req = opts.filter((o) => /requir\w*\b(\W+\w+){0,4}\W+sponsor/i.test(o.text) && !/\b(not|n't|never|no|without)\b(\W+\w+){0,3}\W+(requir|need|sponsor)/i.test(o.text));
+        if (req.length === 1) hit = req[0];
+      }
+      if (!hit && ans && ans.key === 'startMonth' && S.profile.availableStart) {
+        const want = new Date(S.profile.availableStart).getMonth();
+        const idx = (t) => MONTHS.findIndex((m) => norm(t).startsWith(m.slice(0, 3).toLowerCase()));
+        const ms = opts.map((o) => ({ o, i: idx(o.text) })).filter((x) => x.i >= 0);
+        if (ms.length) hit = ms.sort((a, b) => Math.min(Math.abs(a.i - want), 12 - Math.abs(a.i - want)) - Math.min(Math.abs(b.i - want), 12 - Math.abs(b.i - want)) || b.i - a.i)[0].o;
+      }
       dbg('combo', questionFor(input), `| 选项（${opts.length}）`, opts.map((o) => o.text).slice(0, 10), '| 命中', hit && hit.text);
       if (hit && await clickComboOption(input, hit)) return true;
       if (!hit && !big) { comboDiag(input, cands, opts); input.blur(); return false; }
@@ -1625,7 +1710,8 @@
   function agreeAnswer(f) {
     if (!S.settings.acceptTerms || !['combo', 'select', 'listbox', 'radio', 'popcombo'].includes(f.kind)) return null;
     const q = norm(f.question);
-    if (!AGREE_Q_RE.test(q) || AGREE_SKIP_RE.test(q)) return null;
+    const stmt = /^i (hereby )?(certify|attest|acknowledge|understand|agree|authori[sz]e|confirm|declare)/.test(q) && !/marketing|newsletter|promotional|talent (community|network|pool)/.test(q);
+    if (!AGREE_Q_RE.test(q) || (AGREE_SKIP_RE.test(q) && !stmt)) return null;
     const yesOk = /^(please )?(confirm|acknowledge)|^i (have )?(understand|acknowledge|agree|consent|confirm|certify|read|reviewed)/.test(q)
       || (/privacy|terms|consent|acknowledg|agree|policy|notice|disclaimer|attest/.test(q) && !/\b(do|does|have|has|are|were|did) you (currently )?(have|hold|possess|own|obtain)/.test(q));
     const alts = yesOk ? [...AGREE_OPTS, 'Yes'] : AGREE_OPTS;
@@ -1893,11 +1979,11 @@
     return zone || document.body;
   }
   function fileCtxOwn(input) {
-    return [input.id, input.name, input.getAttribute('aria-label'), ...[...(input.labels || [])].map(textOf), textOf(fileZone(input))].join(' ').toLowerCase();
+    return [input.id, input.name, input.getAttribute('aria-label'), ...[...(input.labels || [])].map(textOf), textOf(fileZone(input))].join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   }
   function fileCtx(input) {
     const zone = fileZone(input);
-    return [fileCtxOwn(input), precedingText(zone), precedingHeading(input)].join(' ').toLowerCase();
+    return [fileCtxOwn(input), precedingText(zone), precedingHeading(input)].join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   }
 
   function resumeInputs() {
@@ -1906,6 +1992,9 @@
     const scored = all.map((i) => ({ i, t: ctx(i) }));
     const resume = scored.filter((s) => /resume|\bcv\b|curriculum/.test(s.t) && !/cover|transcript|letter|portfolio|writing sample/.test(s.t));
     if (resume.length) return resume.map((s) => s.i);
+    const vague = scored.filter((s) => !/resume|\bcv\b|curriculum|cover|transcript|letter|motivation|portfolio|writing|sample|certificat|licen|enrol|proof/.test(s.t));
+    const byCtx = vague.find((s) => /resume|\bcv\b|curriculum/.test(fileCtx(s.i)) && !/cover|transcript|motivation|portfolio|writing sample/.test(fileCtx(s.i).replace(/upload your cv|resume\/cv|cv\/resume/g, '')));
+    if (byCtx) return [byCtx.i];
     return all.length === 1 && !/cover|transcript|letter|portfolio|enrol|proof of|writing sample|certificat|licen/.test(fileCtx(all[0])) ? all : [];
   }
 
@@ -1970,6 +2059,21 @@
     await waitFor(() => !isVisible(acc), 3000, 200);
     dbg('隐私声明：已接受', hid && hid.value);
     return 1;
+  }
+
+  const pickerLabel = (b) => cleanLabel(`${precedingText(b) || ''} ${textOf(b)}`);
+  async function uploadViaChooser(btn, name, b64) {
+    if (S.settings.trustedInput === false) return false;
+    const saved = await askAI({ action: 'saveUpload', name, data: b64 }, 30000).catch(() => null);
+    if (!saved || !saved.ok || !saved.path) { dbg('上传：文件没存上', saved && saved.error); return false; }
+    const armed = await new Promise((res) => { try { chrome.runtime.sendMessage({ type: 'armChooser', path: saved.path }, (x) => { void chrome.runtime.lastError; res(x || {}); }); } catch (_) { res({}); } });
+    if (!armed.ok) { dbg('上传：没接管上选文件窗口', armed.error); return false; }
+    const zone = btn.parentElement && btn.parentElement.parentElement ? btn.parentElement.parentElement : document.body;
+    const before = textOf(zone);
+    if (!(await trustedClick(btn))) btn.click();
+    const ok = await waitFor(() => textOf(zone).includes(name) || (textOf(zone) !== before && /\.(pdf|docx?)\b/i.test(textOf(zone))), 15000, 400);
+    dbg('上传（接管选文件窗口）', name, ok ? '成功' : '没看到文件名');
+    return !!ok;
   }
 
   async function uploadViaDialog(btn, file, doneText) {
@@ -2060,6 +2164,12 @@
         uploadedZones.add('gf|resume|' + location.href);
         setStatus(`正在上传简历：${R.label}…`);
         if (await gformUpload(gBtn, resumeFile(R))) { await sleep(500); return true; }
+      }
+      const pBtn = pickerOnlyUploads().find((b) => /\bcv\b|resume|r[eé]sum[eé]|curriculum/i.test(pickerLabel(b)) && !/motivation|cover/i.test(pickerLabel(b)));
+      if (pBtn && !uploadedZones.has('pick|resume|' + location.href)) {
+        uploadedZones.add('pick|resume|' + location.href);
+        setStatus(`正在上传简历：${R.label}…`);
+        if (await uploadViaChooser(pBtn, R.name, R.data)) { logAI(`📎 简历 → ${R.label}（接管选文件窗口）`); await sleep(800); return true; }
       }
       const dBtn = uploadDialogButton(RESUME_BTN_RE);
       if (dBtn && !uploadedZones.has('dlg|resume|' + location.href) && !S.resumes.some((r) => textOf(document.body).includes(r.name))) {
@@ -2973,7 +3083,7 @@
     return n;
   }
 
-  const CL_RE = /cover letter|covering letter|motivation letter|letter of (interest|motivation)/;
+  const CL_RE = /cover letter|covering letter|motivation letter|letter of (interest|motivation)|upload (your |a )?motivation|motivation (letter|statement)/; // ACT Group「Upload your motivation」
   const clFileName = () => `${S.profile.firstName || 'My'}_${S.profile.lastName || 'Cover'}_Cover_Letter.pdf`.replace(/\s+/g, '_');
   function coverLetterInputs() {
     const mode = S.settings.aiCoverLetter || 'always';
@@ -3003,7 +3113,8 @@
   }
   let clJob = null; // { key, promise }
   const clDialogPending = () => S.settings.aiCoverLetter !== 'off' && S.settings.useAI !== false
-    && ((isGoogleForm() && !!gformButton(/cover letter|motivation letter/i)) || (!!uploadDialogButton(CL_BTN_RE) && !textOf(document.body).includes(clFileName())));
+    && ((isGoogleForm() && !!gformButton(/cover letter|motivation letter/i)) || (!!uploadDialogButton(CL_BTN_RE) && !textOf(document.body).includes(clFileName()))
+      || pickerOnlyUploads().some((b) => CL_RE.test(norm(pickerLabel(b)))));
   function startCoverLetter() {
     if (!coverLetterInputs().length && !clDialogPending()) return;
     const key = clKey();
@@ -3046,7 +3157,9 @@
     if (viaDialog) {
       const clFile = resumeFile({ data: CL.data, name: clFileName(), type: 'application/pdf' });
       const g = isGoogleForm() && gformButton(/cover letter|motivation letter/i);
+      const pc = pickerOnlyUploads().find((b) => CL_RE.test(norm(pickerLabel(b))));
       if (g) { if (await gformUpload(g, clFile)) { logAI(`Cover letter → ${CL.name}`); n++; } }
+      else if (pc) { if (await uploadViaChooser(pc, clFileName(), CL.data)) { logAI(`Cover letter → ${CL.name}（接管选文件窗口）`); n++; } }
       else {
         const b = uploadDialogButton(CL_BTN_RE);
         if (b && await uploadViaDialog(b, clFile, clFileName())) { logAI(`Cover letter → ${CL.name}`); n++; }
@@ -3606,9 +3719,10 @@
   const repairedPages = new Set();
   function pageErrors() {
     const errs = visibleErrors();
+    for (const qn of markErrorRequired()) if (errs.length < 8) errs.push(`「${qn.slice(0, 60)}」必填`);
     for (const e of qa('[class*="error" i], [class*="invalid" i], [id*="error" i]', formScope())) {
       if (errs.length >= 8) break;
-      if (!isVisible(e) || e.closest('#wdaf-host') || qa('input, select, textarea', e).length) continue;
+      if (!isVisible(e) || e.closest('#wdaf-host') || e.matches('h1, h2, h3, h4, header, title') || textOf(e) === document.title || qa('input, select, textarea', e).length) continue;
       const t = cleanLabel(textOf(e)).replace(/\s+/g, ' ');
       if (t && t.length <= 160 && !errs.includes(t)) errs.push(t);
     }
@@ -3637,10 +3751,11 @@
   }
 
   function visibleErrors() {
+    const title = norm(document.title);
     return qa('[data-automation-id="errorMessage"], [data-automation-id*="errorBanner" i], [role="alert"]')
       .filter((e) => isVisible(e) && !e.closest('#wdaf-host'))
       .map(textOf)
-      .filter(Boolean);
+      .filter((t) => t && norm(t) !== title && !/^apply\s*[-–—]/i.test(t));
   }
 
   const buttonText = (b) => cleanLabel(textOf(b) || b.value || b.getAttribute('aria-label') || '');
@@ -3718,7 +3833,21 @@
   }
   const codeAsked = (before) => /(verification|security|confirmation) code|one[- ]time (pass)?code|enter the code (we|that was) (sent|emailed)/i.test(textOf(document.body).slice(0, 20000))
     && !/(verification|security|confirmation) code|one[- ]time (pass)?code/i.test(String(before || '').slice(0, 20000));
+  const UPLOAD_BTN_RE = /^(choose (a )?file|select (a )?file|browse|upload( your| a)? (cv|resume|r[eé]sum[eé]|motivation|cover letter|file|document)s?|attach( your)? (cv|resume|file))$/i;
+  function pickerUploaded(b) {
+    for (let z = b.parentElement, i = 0; z && i < 4; z = z.parentElement, i++) {
+      if (qa('button, [role="button"]', z).filter((x) => x !== b && UPLOAD_BTN_RE.test(cleanLabel(textOf(x)))).length) break;
+      if (/\.(pdf|docx?)\b/i.test(textOf(z))) return true;
+    }
+    return false;
+  }
+  function pickerOnlyUploads() {
+    return qa('button, [role="button"]').filter((b) => isVisible(b) && !b.closest('#wdaf-host') && UPLOAD_BTN_RE.test(cleanLabel(textOf(b)))
+      && !q('input[type="file"]', b.parentElement || b) && !pickerUploaded(b));
+  }
   function qPreSubmitProblem() {
+    const pick = pickerOnlyUploads();
+    if (pick.length) return `有 ${pick.length} 个上传栏只能手动选文件（${pick.map((b) => cleanLabel(precedingText(b) || textOf(b)).slice(0, 25)).join('、')}），请你手动上传后再点 Submit`;
     const body = textOf(document.body);
     const resumeShown = S.resumes.some((r) => r.name && body.includes(r.name));
     const emptyResume = qa('input[type="file"]').filter((i) => /resume|\bcv\b/.test(fileCtxOwn(i)) && !(i.files && i.files.length));
@@ -3730,7 +3859,7 @@
   const Q_BLOCKED_MSG = '⏸ 网站没收插件点的提交（多半是网站的防机器人检查）。表都填好了，请你自己点一下 Submit。';
   async function qSubmitGeneric() {
     const bad = qPreSubmitProblem();
-    if (bad) { setStatus(`没自动提交：${bad}。请检查。`); return; }
+    if (bad) { setStatus(`没自动提交：${bad}。请检查。`); qOut('ready', '没自动提交：' + bad); return; }
     if (captchaVisible()) { setStatus('🧩 提交前要过人机验证，请你点一下验证再点 Submit。'); qOut('captcha', '提交前要过人机验证'); return; }
     for (let attempt = 0; attempt < 2 && running; attempt++) {
       const btn = findSubmitButton();
@@ -3817,6 +3946,12 @@
         continue;
       }
       qProgress();
+      if (Q_DONE_PATH.test(location.pathname) && Q_DONE_RE.test(textOf(document.body).slice(0, 20000))) {
+        await addLog('已提交');
+        setStatus('🎉 已提交（这是提交成功页）');
+        qOut('submitted', '提交成功页');
+        break;
+      }
       setStatus('正在填写本页…');
       const rep = await fillPage();
       if (!running) break;
@@ -3886,6 +4021,15 @@
     if (running) return;
     running = true;
     qReported = false;
+    if (Q_DONE_PATH.test(location.pathname) && Q_DONE_RE.test(textOf(document.body).slice(0, 20000))) {
+      running = false;
+      sessionStorage.removeItem(AUTO_KEY);
+      await addLog('已提交');
+      setStatus('🎉 已提交（这是提交成功页）');
+      qOut('submitted', '提交成功页');
+      renderPanel();
+      return;
+    }
     sessionStorage.setItem(AUTO_KEY, '1');
     renderPanel();
     await loadState();
@@ -4015,7 +4159,7 @@
   const STOP_RE = /必填项|请检查|请手动|请把|请点|请自己|没写成|没答上|出错|失败|超时|只认英文|报错/;
   let lastNote = '';
   function noteStop(msg) {
-    if (!STOP_RE.test(msg) || /必填项都已完成/.test(msg) || IN_FRAME && proxyChild) return; // 「本页必填项都已完成」是好消息，不算停下
+    if (!STOP_RE.test(msg) || /必填项都已完成/.test(msg) || IN_FRAME && proxyChild || Q_DONE_PATH.test(location.pathname)) return; // 确认页上不报停下 // 「本页必填项都已完成」是好消息，不算停下
     const key = location.href.split('#')[0] + '|' + msg;
     if (key === lastNote) return;
     lastNote = key;
@@ -4109,7 +4253,11 @@
   const isGoogleForm = () => location.hostname === 'docs.google.com' && /^\/forms\//.test(location.pathname)
     && /application|intern(ship)?\b|career|\bjobs?\b|recruit|hiring|candidate/i.test(document.title + ' ' + textOf(q('[role="heading"]')));
   let appDetected = false;
+  const TRACKER_HOST = IN_FRAME && /(^|\.)(recruitics\.com|doubleclick\.net|googletagmanager\.com|google-analytics\.com|facebook\.com|linkedin\.com|hotjar\.com|clarity\.ms|appcast\.io|cookielaw\.org|onetrust\.com|recaptcha\.net|hcaptcha\.com)$/i.test(location.hostname);
+  const isTrackerFrame = () => TRACKER_HOST || (IN_FRAME && window.innerWidth < 320 && window.innerHeight < 160
+    && qa('input:not([type="hidden"]), select, textarea').filter((e) => isVisible(e)).length < 3);
   function looksLikeApplication() {
+    if (isTrackerFrame()) return false;
     if (isWD()) return true;
     if (/\/CandidateExperience\/.*\/(easy-)?apply(\/|$)/i.test(location.pathname)) return true;
     if (/\/CandidateExperience\//i.test(location.pathname)) return false;
@@ -4236,7 +4384,7 @@
   const ATS_HOST = /(^|\.)(paradox\.ai|applytojob\.com|paylocity\.com)$/i.test(location.hostname)
     || (/(^|\.)myapps\.paychex\.com$/i.test(location.hostname) && /\/appone\//i.test(location.pathname));
   const APPLY_URL_RE = /\/apply(\/|$|\?)|\/application(s)?\b|job_app|\/candidate\/|\/appone\//i;
-  const maybeApplication = () => isWD() || ATS_HOST || isGoogleForm() || APPLY_URL_RE.test(location.pathname + location.search) || /\/CandidateExperience\/.*\/(easy-)?apply(\/|$)/i.test(location.pathname) || (!!q('input[type="email"], input[type="file"], input[name*="mail" i], input[id*="mail" i], input[autocomplete="email"], input[placeholder*="mail" i]') && looksLikeApplication());
+  const maybeApplication = () => !isTrackerFrame() && (isWD() || ATS_HOST || isGoogleForm() || APPLY_URL_RE.test(location.pathname + location.search) || /\/CandidateExperience\/.*\/(easy-)?apply(\/|$)/i.test(location.pathname) || (!!q('input[type="email"], input[type="file"], input[name*="mail" i], input[id*="mail" i], input[autocomplete="email"], input[placeholder*="mail" i]') && looksLikeApplication()));
 
   async function onDetected() {
     appDetected = true;

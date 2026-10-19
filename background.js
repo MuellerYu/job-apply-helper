@@ -19,6 +19,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'queueHello' && sender && sender.tab) { if (!liveDoc) { sendResponse({ item: null }); return; } qHello(sender.tab.id).then(sendResponse); return true; }
   if (msg && msg.type === 'queueReport' && sender && sender.tab) { if (!liveDoc) { sendResponse({ ok: false }); return; } qReport(sender.tab.id, msg).then(sendResponse, (e) => sendResponse({ ok: false, error: String(e) })); return true; }
   if (msg && msg.type === 'queueCmd') { qCmd(msg, sender).then(sendResponse, (e) => sendResponse({ ok: false, error: String(e) })); return true; }
+  if (msg && msg.type === 'armChooser' && sender && sender.tab && msg.path) { armChooser(sender.tab.id, msg.path).then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) })); return true; }
   if (msg && msg.type === 'sleep') { setTimeout(() => sendResponse(true), Math.min(Math.max(Number(msg.ms) || 0, 0), 60000)); return true; }
   if (msg && msg.type === 'viewResume' && msg.id) {
     const t = sender && sender.tab;
@@ -178,8 +179,9 @@ const CDP_KEYS = { Enter: [13, 'Enter', '\r'], Tab: [9, 'Tab'], ArrowDown: [40, 
 async function trustedInput(tabId, steps) {
   const target = { tabId };
   const send = (method, params) => chrome.debugger.sendCommand(target, method, params || {});
+  const held = qEmu.has(tabId); // 队列标签页已经连着（焦点模拟）：直接用，用完也别断开
   try {
-    await chrome.debugger.attach(target, '1.3');
+    if (!held) await chrome.debugger.attach(target, '1.3');
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }
@@ -219,9 +221,49 @@ async function trustedInput(tabId, steps) {
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   } finally {
-    try { await chrome.debugger.detach(target); } catch (_) { /* 已经断开 */ }
+    if (!held) { try { await chrome.debugger.detach(target); } catch (_) { /* 已经断开 */ } }
   }
 }
+
+const qEmu = new Set();
+async function qEmulateFocus(tabId) {
+  if (qEmu.has(tabId)) return;
+  try {
+    await chrome.debugger.attach({ tabId }, '1.3');
+    qEmu.add(tabId);
+    await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+  } catch (e) { console.warn('[投递队列] 焦点模拟没开上', tabId, e && e.message); }
+}
+async function qUnemulate(tabId) {
+  if (!qEmu.delete(tabId)) return;
+  try { await chrome.debugger.detach({ tabId }); } catch (_) { /* 标签页已经关了 */ }
+}
+chrome.debugger.onDetach.addListener((src) => { if (src.tabId) qEmu.delete(src.tabId); });
+
+const qChooser = new Map(); // tabId → { path, until, attachedHere }
+async function armChooser(tabId, path) {
+  const target = { tabId };
+  let attachedHere = false;
+  if (!qEmu.has(tabId)) { await chrome.debugger.attach(target, '1.3'); qEmu.add(tabId); attachedHere = true; }
+  await chrome.debugger.sendCommand(target, 'Page.enable');
+  await chrome.debugger.sendCommand(target, 'Page.setInterceptFileChooserDialog', { enabled: true });
+  qChooser.set(tabId, { path, until: Date.now() + 20000, attachedHere });
+  setTimeout(() => { const c = qChooser.get(tabId); if (c && c.path === path) disarmChooser(tabId, c); }, 21000); // 没弹窗就收回
+  return { ok: true };
+}
+async function disarmChooser(tabId, c) {
+  qChooser.delete(tabId);
+  try { await chrome.debugger.sendCommand({ tabId }, 'Page.setInterceptFileChooserDialog', { enabled: false }); } catch (_) { /* 已断开 */ }
+  if (c && c.attachedHere) qUnemulate(tabId);
+}
+chrome.debugger.onEvent.addListener(async (src, method, params) => {
+  if (method !== 'Page.fileChooserOpened' || !src.tabId) return;
+  const c = qChooser.get(src.tabId);
+  try {
+    if (c && Date.now() < c.until) await chrome.debugger.sendCommand({ tabId: src.tabId }, 'DOM.setFileInputFiles', { files: [c.path], backendNodeId: params.backendNodeId });
+  } catch (e) { console.warn('[上传] 放文件失败', e && e.message); }
+  disarmChooser(src.tabId, c);
+});
 
 async function captureFor(tab) {
   const t = await chrome.tabs.get(tab.id);
@@ -290,7 +332,8 @@ function qTx(fn) {
 function qUrlKey(u) {
   try {
     const x = new URL(u);
-    return (x.hostname + x.pathname.replace(/^\/[a-z]{2}-[A-Z]{2}(?=\/)/, '').replace(/\/(apply|application)(\/.*)?$/, '').replace(/\/$/, '')).toLowerCase();
+    return (x.hostname + x.pathname.replace(/^\/[a-z]{2}-[A-Z]{2}(?=\/)/, '').replace(/\/(confirmation|thank-?you|thanks|success|submitted|application-?complete)\/?$/i, '')
+      .replace(/\/(apply|application)(\/.*)?$/, '').replace(/\/$/, '')).toLowerCase();
   } catch (_) { return String(u || '').toLowerCase(); }
 }
 
@@ -316,7 +359,7 @@ async function qReport(tabId, m) {
         if (it.need === 'login') Q.meta.preferHost = it.host;
         it.status = 'resumed';
         it.need = '';
-        return { next: true };
+        return { next: true, resume: true };
       }
       return null;
     }
@@ -334,12 +377,14 @@ async function qReport(tabId, m) {
     }
     it.status = 'needs';
     it.need = st;
-    if (Q_PARK.has(st)) return { next: true }; // 标签页留着等你
+    if (Q_PARK.has(st)) return { next: true, park: true }; // 标签页留着等你
     const close = it.tabId;
     it.tabId = null;
     return { close, next: true };
   });
   if (out && out.close) setTimeout(() => chrome.tabs.remove(out.close).catch(() => {}), 2500);
+  if (out && out.park) qUnemulate(tabId);
+  if (out && out.resume) qEmulateFocus(tabId);
   if (out && out.next) setTimeout(qNext, 3000);
   return { ok: true };
 }
@@ -402,6 +447,7 @@ async function qOpen(pick) {
     }
     await setItem({ tabId });
     await chrome.tabs.update(tabId, { url: pick.url });
+    qEmulateFocus(tabId);
   } catch (e) {
     await setItem({ status: 'needs', need: 'error', note: '打不开标签页：' + e, tabId: null });
     setTimeout(qNext, 3000);
@@ -450,6 +496,7 @@ async function qTick() {
       await qTx(() => { if (it.status === 'running' || it.status === 'resumed') Object.assign(it, { status: 'needs', need: 'closed', note: '标签页没了' }); it.tabId = null; });
     }
   }
+  for (const it of Q.items) if ((it.status === 'running' || it.status === 'resumed') && it.tabId) qEmulateFocus(it.tabId);
   const close = await qTx((Q2) => {
     const now = Date.now();
     const out = [];
@@ -488,11 +535,15 @@ async function qImport(data) {
     const out = [];
     const fresh = new Set();
     let added = 0;
+    const seenKey = new Map(Q.items.filter((x) => x.status !== 'pending').map((x) => [qUrlKey(x.url), x.status]));
     for (const r of rows) {
+      const k = qUrlKey(r.url);
       const old = by.get(r.id);
+      if (seenKey.has(k) && !(old && old.status !== 'pending')) continue;
+      seenKey.set(k, 'pending');
       if (old) { Object.assign(old, { url: r.url, company: r.company, title: r.title, loc: r.loc, resume: r.resume, prio: r.prio, ats: r.ats, host: r.host }); out.push(old); by.delete(r.id); }
       else {
-        const was = doneKeys.get(qUrlKey(r.url));
+        const was = doneKeys.get(k);
         out.push({ ...r, status: was ? 'dup' : 'pending', note: was ? '投递记录：' + was : '' });
         fresh.add(r.id);
         added++;
