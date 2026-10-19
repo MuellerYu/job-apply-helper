@@ -5,8 +5,15 @@
   document.querySelectorAll('#wdaf-host').forEach((h) => h.remove());
 
   const AUTO_KEY = 'wdaf-auto-running';
-  const BUILD = '2026-10-19.181'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const BUILD = '2026-10-19.190'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
+  let QUEUE = null;
+  let QUEUE_SUBMIT = false; // 队列设置：填完自动提交
+  const sleep = (ms) => new Promise((r) => {
+    if (QUEUE && document.hidden && ms >= 100) {
+      try { chrome.runtime.sendMessage({ type: 'sleep', ms }, () => { void chrome.runtime.lastError; r(); }); return; } catch (_) { /* 插件断开了，用普通定时器 */ }
+    }
+    setTimeout(r, ms);
+  });
   const dbg = (...a) => console.debug('[自动投递]', ...a); // 在网页的控制台里看插件每一步做了什么
   const alive = () => { try { return !!chrome.runtime?.id; } catch (_) { return false; } };
   const q = (sel, root = document) => root.querySelector(sel);
@@ -123,6 +130,8 @@
     const forced = sessionStorage.getItem(overrideKey());
     const forcedResume = forced && S.resumes.find((r) => r.id === forced);
     if (forcedResume) return { resume: forcedResume, hits: [], manual: true };
+    const queued = QUEUE && QUEUE.resume && S.resumes.find((r) => r.id === QUEUE.resume);
+    if (queued) return { resume: queued, hits: ['候选池表格指定'], manual: false };
     const info = await getJobInfo();
     return wdafPickResume(S.resumes, S.defaultResumeId, info.title, info.desc);
   }
@@ -337,10 +346,12 @@
     { re: SMS_OK_RE, key: 'smsTerms', kinds: ['checkbox'] },
     { re: /country.{0,25}citizenship|citizenship.{0,20}country|which country.{0,30}citizen|^(country of |your )?(citizenship|nationality)\??$/, key: 'citizenship', kinds: [...PICK, 'text'] },
     { re: /country phone code|phone country|country code/, key: 'country', kinds: PICK },
-    { re: /country (do|did) you (currently )?(live|reside)|country of residence|current country|which country/, key: 'country', kinds: PICK },
+    { re: /country (do|did) you (currently )?(live|reside)|country of residence|current country|which country|country are you (applying|located|based) (from|in)/, key: 'country', kinds: PICK },
     { re: /phone device type|phone type|device type/, key: 'phoneType', kinds: PICK },
     { re: /\bphone\b|mobile number|\bcell\b/, key: 'phone', kinds: TEXT, self: true },
     { re: /e-?mail/, key: 'email', kinds: TEXT, self: true },
+    { re: /preferred (first |given )?name|nickname|name (do )?you (prefer|go by)|(would like to be|prefer to be) called/, key: 'preferredName', kinds: TEXT },
+    { re: /i (have|use) a preferred name|use (a |my )?preferred name/, key: 'preferredNameBox', kinds: ['checkbox'] },
     { re: /preferred (first |last |given |family )?name|nickname|local (given|family) name/, key: null },
     { re: /additional information that (could|would|might) be helpful|we don'?t need a cover letter|use the space below to tell us|anything else (you'?d like|we should know)/, key: null, kinds: TEXT },
     { re: /middle name/, key: 'middleName', kinds: TEXT, self: true },
@@ -375,7 +386,7 @@
     { re: /depart the united states|foreign residency requirement|home(-country)? (physical )?residency requirement|two-year (home )?residency|212\(e\)/, key: 'homeResidency' },
     { re: /(will|do|would) you (\w+ ){0,6}(require|need)\b.{0,40}sponsor/, key: 'needSponsorship', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /without (\w+ ){0,4}sponsor/, key: 'AUTH_NO_SPONSOR', kinds: [...PICK, 'radio', 'checkgroup'] },
-    { re: /authori[sz]ed to work (indefinitely|permanently|for any employer|without (any )?restriction)|(indefinitely|permanently) (authori[sz]ed|eligible)|unrestricted (work )?(authori[sz]ation|right to work)/, key: 'AUTH_NO_SPONSOR', kinds: [...PICK, 'radio', 'checkgroup'] },
+    { re: /authori[sz]ed to work (indefinitely|permanently|for any employer|without (any )?restriction)|(indefinitely|permanently) (authori[sz]ed|eligible)|unrestricted (work )?(authori[sz]ation|right to work)|(authori[sz]ed|eligible|legally (able|permitted)|right) to work\b.{0,40}\bwithout (any )?(restrictions?|limitations?|time limit)/, key: 'AUTH_NO_SPONSOR', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /authori[sz]ed to work|legally (authori[sz]ed|eligible|permitted|qualified)|eligib\w* to work|right to work|work authori[sz]ation|^work eligibility/, key: 'workAuthorized', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /(current|your|present) .{0,30}(visa|immigration|work authori[sz]ation) (status|type|category)|^(us |u\.s\. )?(visa|immigration) (status|type|category)\b/, key: 'visaStatus', kinds: [...PICK, 'radio'] },
     { re: /sponsor|visa status|h-?1b/, key: 'needSponsorship', kinds: [...PICK, 'radio', 'checkgroup'] },
@@ -390,10 +401,11 @@
     { re: /\b(?!(?:a|an|the|any|your|accredited|current|four-year|degree)\b)[a-z]+ university (undergraduate|graduate|student|program|alum)|\buniversity of [a-z]+( [a-z]+)?\b.{0,40}(student|program|enrolled|alum)|graduate[d]? from an? [a-z]+( [a-z]+)? high school/, key: 'otherSchool', kinds: [...PICK, 'radio'] },
     { re: /^degree status$|status of (your )?degree|degree (completion )?status/, key: 'degreeStatus', kinds: [...PICK, 'radio'] },
     { re: /degree (granted|conferred|awarded|completed)|have you (graduated|completed your degree)/, key: 'degreeGranted' },
-    { re: /level of education you are (currently )?(completing|pursuing)|current level of education/, key: 'degree', kinds: PICK },
+    { re: /level of education you are (currently )?(completing|pursuing)|current level of education|(degree|education)( level)? (that )?(you are|you're) currently (pursuing|enrolled in|working (on|towards?)|completing|obtaining|seeking)/, key: 'degree', kinds: PICK },
     { re: /graduation (date|year|month|term|semester)|(expected|anticipated) (date of )?graduation|when (do|will) you (expect to )?graduate|expect(ed|ing)? to graduate|graduat\w* (date|year)/, key: 'gradDate', kinds: [...PICK, 'text'] },
     { re: /^(?!.*(highest|complet|attain|obtain)).*((degree|education)\b.{0,30}pursu|(education|degree|academic) level|level of (education|degree|study)|degree type|class standing|year in school|year of study)/, key: 'degree', kinds: PICK },
     { re: /(school|university|college|institution)\b.{0,60}\bundergrad(uate)? (studies|degree|education)|undergrad(uate)? (school|university|college|institution)/, key: 'undergradSchool', kinds: [...PICK, 'text'] },
+    { re: /undergrad\w*.{0,30}(major|discipline|field|area of study|concentration)|(major|discipline|field of study|area of study).{0,30}undergrad|bachelor'?s?( degree)?.{0,20}(major|discipline|field of study)/, key: 'undergradMajor' },
     { re: /(list|name|enter|provide|what is|which)( the| your)? (name of (the |your )?)?(university|college|school|institution)( you are| you're)? (currently )?(attend|enrolled|studying)|(university|college|school) you are currently attending/, key: 'school', kinds: TEXTISH },
     { re: /class standing|year in school|academic (standing|level|year)/, key: 'classStanding', kinds: TEXT },
     { re: /^(where|at which (school|university|college|institution)|which (school|university|college|institution)) (are|do) you (currently )?(pursu|attend|stud|enrol)/, key: 'school', kinds: TEXTISH },
@@ -419,6 +431,7 @@
     { re: /(year|when) did you graduate (from )?high school|high school (graduation|grad) (year|date)|year of high school graduation/, key: 'hsGradYear' },
     { re: /cpa eligibility (through|via|by)|meet(ing)? (the )?cpa (eligibility|licensure|education)|cpa (licensure |license )?pathway|150[- ]credit/, key: 'cpaPathway', kinds: [...TEXT, ...PICK, 'radio'] },
     { re: /essential functions/, key: 'essentialFunctions' },
+    { re: /(willing|agree|consent|able|prepared) to (submit to|undergo|complete|pass|take|participate in)( a| an| the)?( pre-?employment| standard)? (background|criminal|drug|credit)|(background (check|screen\w*|investigation)|drug (test|screen\w*)).{0,40}\b(willing|agree|consent)\b/, key: 'YES', kinds: [...PICK, 'radio'] },
     { re: /meet (all (of )?)?the (minimum|basic|required|stated) (qualifications|requirements)|minimum qualifications/, key: 'essentialFunctions' }, // 是否满足最低任职要求
     { re: /driv(ing|er'?s|ers) licen[cs]e|valid licen[cs]e to drive/, key: 'driversLicense' },
     { re: /highest degree.{0,30}in progress|(achieved|completed|obtained) or in progress/, key: 'degree' },
@@ -445,7 +458,7 @@
     { re: /(come|work) (in|into|from) (the |our )?office|in[- ]office .{0,30}days|\d(-|–| to )\d days (per|a) week|days (per|a) week .{0,40}office/, key: 'inOffice' },
     { re: /earliest (availability|start|date)|availab\w* to (start|begin)|^start date$|when (can|could) you start|desired start date|how soon (are you|can you|could you|would you be) (available|able) to start/, key: 'availableStart', kinds: [...TEXT, 'date'] },
     { re: /^(second|2nd|additional|double|secondary) (major|field of study)|^minor\b/, key: null }, // Jane Street：Secondary Major / Field of study
-    { re: /^(?!.*\bgpa\b).*(field of study|major|discipline|area of study)/, key: 'fieldOfStudy' },
+    { re: /^(?!.*\bgpa\b)(?!.*(disabilit|major life|chronic|impairment)).*(field of study|\bmajor\b|discipline|area of study)/, key: 'fieldOfStudy' },
     { re: /(programming|software|statistical|coding) (tools?|languages?|packages?|software)\b.{0,160}\b(outside|beyond|independent|internship|thesis|research assistant|work experience|professional)/, key: 'toolsWork', kinds: TOOL_KINDS },
     { re: /(programming|software|statistical|coding) (tools?|languages?|packages?|software)\b.{0,160}\b(coursework|course ?work|classroom|class(es)? assignments?|courses?\b|academic)/, key: 'toolsCoursework', kinds: TOOL_KINDS },
     { re: /which (programming|software|statistical|coding) (tools?|languages?|packages?)|(programming|software|coding) (tools?|languages?)\b.{0,60}(used|familiar|proficien|experience|know|comfortable)/, key: 'toolsAll', kinds: TOOL_KINDS },
@@ -501,6 +514,7 @@
     if (key === 'NONE_ABOVE') return 'None of the above';
     if (key === 'NO') return 'No';
     if (key === 'TERMS') return S.settings.acceptTerms ? 'CHECK' : '';
+    if (key === 'preferredNameBox') return P.preferredName ? 'CHECK' : '';
     if (key === 'AUTH_NO_SPONSOR') return P.needSponsorship === 'Yes' ? 'No' : P.workAuthorized;
     if (key === 'skills') return P.skills ? P.skills.split(/[,，;；]/).map((s) => s.trim()).filter(Boolean) : '';
     if (key === 'toolsCoursework' || key === 'toolsWork' || key === 'toolsAll') {
@@ -614,6 +628,7 @@
     if (key === 'visaStatus') return P.f1Status === 'Yes' ? ['F-1', 'F-1 Student', 'F-1 Student Visa', 'F1', 'F-1 Visa', 'Student (F-1)', 'F-1 CPT', 'F-1 (CPT)', 'CPT'] : [];
     if (key === 'cpaPathway') return [P.cpaPathway, 'traditional 150-credit hour pathway', '150-credit hour', '150 credit hour', '150 hours'].filter(Boolean);
     if (key === 'undergradSchool') return [P.undergradSchool, P.undergradSchoolAlt].filter(Boolean);
+    if (key === 'undergradMajor') return [P.undergradMajor, ...String(P.undergradMajorAlt || '').split(/[,;，；]/).map((x) => x.trim())].filter(Boolean);
     if (key === 'recruitingTimelines') return S.profile.otherOffers === 'No' ? ['No', 'None', 'Not at this time', 'N/A'] : [];
     if (key === 'gradDate') return gradDateCands();
     if (key === 'degree') return degreeCands();
@@ -696,6 +711,10 @@
     }
     if ((/^\(?if (yes|no|so|you answered|the answer|applicable|other)\b|^.{0,40}\bif ["“']?other\b|if not listed|^.{0,40}\bother\b.{0,40}please specify|please specify[.:]?$/.test(nq)
       || /^if ["“'][^"”']{1,80}["”']|^if referred/.test(nq)) && !/\brace\b|ethnic/.test(nq)) return null;
+    if (f && kind === 'text' && /preferred/i.test(`${f.el.id || ''} ${f.el.name || ''} ${f.el.getAttribute('data-automation-id') || ''}`) && /first|given|last|family|middle/.test(nq)) {
+      const P = S.profile;
+      return { key: 'preferredName', value: !P.preferredName ? '' : /last|family/.test(nq) ? P.lastName : /middle/.test(nq) ? '' : P.preferredName };
+    }
     for (const r of RULES) {
       if (r.kinds && !r.kinds.includes(kind)) continue;
       if (r.self && otherParty) continue;
@@ -1761,6 +1780,7 @@
     excludeRe = ans.key === 'degree'
       ? new RegExp([!/mba|business admin/i.test(S.profile.degree || '') && '\\bm\\.?b\\.?a\\b|business administration', S.profile.enrolled !== 'No' && '[-–—]\\s*(complete|completed|graduated)\\s*$'].filter(Boolean).join('|') || '$^', 'i')
       : ans.key === 'source' ? /\buniversity\b|\bcampus\b|\bschool\b|\bcollege\b|academic|faculty|career (fair|services)/i
+      : (ans.key === 'workAuthorized' || ans.key === 'AUTH_NO_SPONSOR') && S.profile.needSponsorship === 'Yes' ? /any employer|without (the need for |needing |requiring |requirement of )?(an? )?(employer |visa )?sponsor|(do not|don'?t|will not|won'?t|never) (need|require) (\w+ )?sponsor|no sponsorship|unrestricted|without restriction|permanent(ly)? (resident|authori)|u\.?s\.? citizen|green card/i
       : ans.key === 'visaStatus' ? /\bopt\b|stem|h-?1b|h-?4|l-?[12]|tn\b|e-?3|j-?[12]|o-?1|0-1|daca|citizen|permanent|green card|not applicable/i
       : ans.key === 'veteran' && /^not a protected veteran$/i.test(S.profile.veteran || '') ? /identify as (a |one or more)|\bi am a (protected )?veteran/i
       : null;
@@ -2493,6 +2513,7 @@
   }
   if (location.hostname === 'example.com' && !IN_FRAME) {
     window.addEventListener('message', async (e) => {
+      if (e.source === window && e.data && e.data.__wdafQueue) { chrome.runtime.sendMessage({ type: 'queueCmd', ...e.data.__wdafQueue }, (r) => { void chrome.runtime.lastError; window.postMessage({ __wdafQueueReply: r || null }, '*'); }); return; }
       if (e.source === window && e.data && e.data.__wdafShotTest) { const shot = await opScreenshot(q('div') || document.body, []); window.postMessage({ __wdafShotResult: shot.length, head: shot.slice(0, 16) }, '*'); return; }
       if (e.source !== window || !e.data || !e.data.__wdafTrustedTest) return;
       const inp = q('#wdaf-test');
@@ -3654,34 +3675,154 @@
     ? currentStep() + '|' + location.pathname
     : location.href + '|' + document.title + '|' + collectFields().map((f) => f.question).join('|').slice(0, 800);
 
+  const Q_DONE_RE = /application (has been |was )?(successfully )?(submitted|received|sent)|thank you for (applying|your application|submitting)|thanks for applying|successfully (applied|submitted)|we('ve| have) received your application|your application has been sent|application submitted|感[谢謝](您)?(的申[请請]|申[请請]|花[时時][间間]申[请請]|投[递遞])|申[请請](已|已[经經])(提交|送出|收到)|已收到[你您]的申[请請]/i; // Greenhouse 按浏览器语言显示确认页（Garda 实测是中文「感謝您花時間申請」）
+  const Q_CLOSED_RE = /(this|the) (job|position|posting|requisition|role|opening)( posting)? (is )?(no longer|not) (available|accepting|open|active)|(job|position|posting|requisition) (has been |is )?(closed|filled|expired|removed)|no longer accepting applications|page (you are looking for|you requested|you're looking for) (doesn'?t|does not|could not|cannot|can'?t) (exist|be found)|job not found|(this|the) job (is|has) (closed|expired)|sorry,? (this|the) (job|position|posting) /i;
+  const Q_DUP_RE = /you('ve| have) already applied|already (applied|submitted an application) (for|to) this|you have previously applied (for|to) this/i;
+  const Q_APPLY_RE = /^(apply|apply now|apply for (this|the) (job|position|role|opportunity)|apply to (this )?(job|position|role)|apply online|apply here|apply on (the )?company('s)? (site|website)|start (your |my )?application|i'?m interested|submit (an )?application)$/i;
+  let qReported = false; // 这一轮自动流程已经回报过结果
+  let qLastState = '';
+  let qLastProgress = 0;
+
+  function qSend(m) {
+    if (!QUEUE || !alive()) return Promise.resolve();
+    return new Promise((r) => {
+      try { chrome.runtime.sendMessage({ type: 'queueReport', url: location.href.split('#')[0], ...m }, () => { void chrome.runtime.lastError; r(); }); } catch (_) { r(); }
+    });
+  }
+  function qOut(state, note, missing) {
+    if (!QUEUE) return;
+    if (state !== 'login') qReported = true; // 等登录不算结果：登录后接着跑，后面卡住还要报
+    if (state === qLastState && state !== 'submitted') return; // 同一个结果只报一次
+    qLastState = state;
+    qLastProgress = 0; // 之后一有进展马上报（你登录完，队列就知道这个网站可以接着投了）
+    dbg('队列回报', state, note);
+    QUEUE.status = 'needs';
+    QUEUE.need = state;
+    qSend({ state, note: String(note || '').slice(0, 400), missing: (missing || []).map((f) => (typeof f === 'string' ? f : f && f.question) || '') });
+  }
+  function qProgress() {
+    if (!QUEUE || Date.now() - qLastProgress < 15000) return;
+    qLastProgress = Date.now();
+    if (qLastState === 'login') qLastState = '';
+    qSend({ state: 'progress' });
+  }
+  const Q_DONE_PATH = /\/(confirmation|thank-?you|thanks|success|submitted|application-?complete)(\/|$)/i;
+  function qSuccessNow(before, path0) {
+    if (path0 && location.pathname !== path0 && Q_DONE_PATH.test(location.pathname)) return true;
+    const m = textOf(document.body).slice(0, 30000).match(Q_DONE_RE);
+    return !!m && !String(before || '').includes(m[0]);
+  }
+  function captchaVisible() {
+    return qa('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[title*="captcha" i], iframe[title*="challenge" i]')
+      .some((f) => isVisible(f) && f.offsetHeight >= 60 && !/size=invisible/.test(f.src || '') && !(/recaptcha/.test(f.src || '') && /anchor/.test(f.src || '') && f.offsetWidth <= 260));
+  }
+  const codeAsked = (before) => /(verification|security|confirmation) code|one[- ]time (pass)?code|enter the code (we|that was) (sent|emailed)/i.test(textOf(document.body).slice(0, 20000))
+    && !/(verification|security|confirmation) code|one[- ]time (pass)?code/i.test(String(before || '').slice(0, 20000));
+  function qPreSubmitProblem() {
+    const body = textOf(document.body);
+    const resumeShown = S.resumes.some((r) => r.name && body.includes(r.name));
+    const emptyResume = qa('input[type="file"]').filter((i) => /resume|\bcv\b/.test(fileCtxOwn(i)) && !(i.files && i.files.length));
+    if (emptyResume.length && !resumeShown) return '简历栏是空的';
+    const miss = collectFields().filter((f) => stillNeeded(f));
+    if (miss.length) return `还有 ${miss.length} 个必填项空着`;
+    return '';
+  }
+  const Q_BLOCKED_MSG = '⏸ 网站没收插件点的提交（多半是网站的防机器人检查）。表都填好了，请你自己点一下 Submit。';
+  async function qSubmitGeneric() {
+    const bad = qPreSubmitProblem();
+    if (bad) { setStatus(`没自动提交：${bad}。请检查。`); return; }
+    if (captchaVisible()) { setStatus('🧩 提交前要过人机验证，请你点一下验证再点 Submit。'); qOut('captcha', '提交前要过人机验证'); return; }
+    for (let attempt = 0; attempt < 2 && running; attempt++) {
+      const btn = findSubmitButton();
+      if (!btn) break;
+      const before = textOf(document.body);
+      const path0 = location.pathname;
+      await qSend({ state: 'submitting' });
+      setStatus('批量队列：自动提交…');
+      btn.click();
+      const r = await waitFor(() => (!running ? 'stop' : qSuccessNow(before, path0) ? 'ok' : codeAsked(before) ? 'verify' : captchaVisible() ? 'captcha' : null), 45000, 700);
+      if (r === 'ok') { await addLog('已提交'); setStatus('🎉 已提交！'); qOut('submitted', '页面显示提交成功'); return; }
+      if (r === 'verify') { setStatus(`📧 提交后要邮箱验证码（发到 ${S.profile.email || '你的邮箱'}），请你填进页面再点提交。`); qOut('verify', `提交后要邮箱验证码（发到 ${S.profile.email || '邮箱'}）`); return; }
+      if (r === 'captcha') { setStatus('🧩 提交时要人机验证，请你过一下验证。'); qOut('captcha', '提交时要人机验证'); return; }
+      if (r === 'stop') return;
+      if (attempt === 0) {
+        lastPageErrors = pageErrors();
+        reviewedSigs.clear();
+        try { const rep = await fillPage(); if (rep.missing.length) { setStatus(`提交没过，还有 ${rep.missing.length} 个必填项没填`, rep.missing.map((f) => f.question)); return; } } finally { lastPageErrors = []; }
+      }
+    }
+    const errs = pageErrors();
+    setStatus(errs.length ? `点了提交没成功，页面报错：${errs.slice(0, 3).join('；')}` : Q_BLOCKED_MSG);
+    qOut('ready', errs.length ? '点了提交没成功：' + errs.slice(0, 3).join('；') : '网站没收插件点的提交，等你点一下 Submit');
+  }
+  async function qWaitDone() {
+    const before = textOf(document.body);
+    const path0 = location.pathname;
+    if (await waitFor(() => !alive() || qSuccessNow(before, path0), 24 * 3600 * 1000, 3000) && alive()) { await addLog('已提交'); qOut('submitted', '你处理后提交成功'); }
+  }
+  async function queueDrive() {
+    const afterSubmit = (QUEUE.submitAt && Date.now() - QUEUE.submitAt < 15 * 60000) || (QUEUE.status === 'needs' && ['ready', 'verify', 'captcha'].includes(QUEUE.need));
+    if (afterSubmit && (Q_DONE_RE.test(textOf(document.body).slice(0, 30000)) || Q_DONE_PATH.test(location.pathname))) { await addLog('已提交'); qOut('submitted', '提交成功页'); return; }
+    for (let i = 0; i < 8; i++) {
+      await sleep(i ? 3000 : 2500);
+      if (!alive()) return;
+      if (appDetected || running || proxyChild || isWD()) return;
+      if (maybeApplication()) { onDetected(); return; }
+      const body = textOf(document.body).slice(0, 6000);
+      if (Q_DUP_RE.test(body)) { qOut('dup', '页面说已经投过'); return; }
+      if (Q_CLOSED_RE.test(body) || /[?&]error=true/.test(location.search)) { qOut('closed', '职位已关闭：' + ((body.match(Q_CLOSED_RE) || [])[0] || location.search)); return; }
+      const a = qa('a, button, [role="button"], input[type="submit"], input[type="button"]')
+        .filter((e) => isVisible(e) && !e.closest('#wdaf-host'))
+        .find((e) => Q_APPLY_RE.test(cleanLabel(textOf(e) || e.value || e.getAttribute('aria-label') || '').replace(/\s*[›»→>]+$/, '')));
+      if (!a || (QUEUE.hops || 0) >= 6) continue;
+      QUEUE.hops = (QUEUE.hops || 0) + 1;
+      await qSend({ state: 'hop' });
+      setStatus('批量队列：点 Apply…');
+      const href = a.tagName === 'A' && a.getAttribute('href');
+      if (href && !/^(#|javascript:)/i.test(href)) location.assign(a.href); // 同一个标签页打开，不弹新窗口
+      else a.click();
+      await sleep(4000);
+    }
+    if (!appDetected && !running && !proxyChild && !isWD()) qOut('noform', '没找到申请表或 Apply 按钮');
+  }
+
   async function onReview() {
     await addLog('已填到 Review');
     await healthCard();
-    if (!S.settings.autoSubmit) {
+    if (QUEUE ? !QUEUE_SUBMIT : !S.settings.autoSubmit) {
       setStatus('✅ 已到 Review 页。请检查一遍，确认无误后自己点 Submit。');
+      qOut('ready', '已到 Review 页，等你点 Submit');
       return;
     }
     const btn = findSubmitButton();
     if (!btn) { setStatus('到了 Review 页，但没找到 Submit 按钮'); return; }
+    const bad = QUEUE && qPreSubmitProblem();
+    if (bad) { setStatus(`没自动提交：${bad}。请检查。`); return; }
+    const before = textOf(document.body);
+    await qSend({ state: 'submitting' });
     btn.click();
-    const ok = await waitFor(() => /submitted|thank you|application (has been )?received/i.test(textOf(document.body)), 20000, 500);
+    const ok = await waitFor(() => qSuccessNow(before) || /application submitted|congratulations/i.test(textOf(document.body).slice(0, 5000)) && !/application submitted|congratulations/i.test(before.slice(0, 5000)), 30000, 500);
     await addLog(ok ? '已提交' : '已点提交（未确认）');
     setStatus(ok ? '🎉 已提交！' : '点了 Submit，请确认页面是否提交成功');
+    if (QUEUE) qOut(ok ? 'submitted' : 'stuck', ok ? 'Workday 显示已提交' : '点了 Submit，没看到提交成功');
   }
 
   async function runGeneric() {
     for (let guard = 0; guard < 30 && running && alive(); guard++) {
       if (isSignInPage()) {
         setStatus('请先登录或注册（可用 Chrome 密码管理器），登录后点「自动到提交前」继续…');
-        await waitFor(() => !running || !isSignInPage(), 10 * 60 * 1000, 1000);
+        qOut('login', '要登录或注册：' + location.hostname);
+        await waitFor(() => !running || !isSignInPage(), QUEUE ? 24 * 3600 * 1000 : 10 * 60 * 1000, 1000);
         await sleep(2000);
         continue;
       }
+      qProgress();
       setStatus('正在填写本页…');
       const rep = await fillPage();
       if (!running) break;
       if (rep.missing.length && rep.missing.every((f) => /security code|verification code|enter the (8|eight)[- ]character code/i.test(f.question))) {
         setStatus(`📧 这页要邮箱验证码：Greenhouse 把 8 位验证码发到了 ${S.profile.email || '你的邮箱'}，请填进页面上的格子再点提交。`);
+        qOut('verify', `Greenhouse 邮箱验证码（发到 ${S.profile.email || '邮箱'}）`);
         break;
       }
       if (rep.missing.length) {
@@ -3690,8 +3831,9 @@
       }
       if (isMixedSignupPage()) {
         setStatus('✅ 本页资料填好了，只剩「Create a login」的密码要你自己设（可用 Chrome 密码管理器）。设好后自己点页面上的继续按钮，插件会接着填下一页。');
+        qOut('login', '要设登录密码（Create a login）：' + location.hostname);
         const sig = pageSig();
-        await waitFor(() => !running || (!isMixedSignupPage() && pageSig() !== sig), 15 * 60 * 1000, 1000);
+        await waitFor(() => !running || (!isMixedSignupPage() && pageSig() !== sig), QUEUE ? 24 * 3600 * 1000 : 15 * 60 * 1000, 1000);
         if (!running) break;
         await sleep(2000);
         continue;
@@ -3714,6 +3856,8 @@
         await addLog('已填到提交前');
         await snapshotPage('最后一页');
         await healthCard();
+        if (QUEUE && QUEUE_SUBMIT && findSubmitButton()) { await qSubmitGeneric(); break; }
+        if (QUEUE) qOut('ready', findSubmitButton() ? '填到最后一页了，等你点 Submit' : '没找到下一步 / 提交按钮');
         setStatus(findSubmitButton()
           ? '✅ 已经填到最后一页。请从头检查一遍，确认无误后自己点 Submit。'
           : '✅ 本页填好了。没找到「下一步」按钮，请检查后自己继续或提交。');
@@ -3741,12 +3885,14 @@
   async function runAuto() {
     if (running) return;
     running = true;
+    qReported = false;
     sessionStorage.setItem(AUTO_KEY, '1');
     renderPanel();
     await loadState();
     try {
       if (!isWD()) { await runGeneric(); return; }
       for (let guard = 0; guard < 40 && running && alive(); guard++) {
+        qProgress();
         const start = [S.settings.startMode, 'autofillWithResume', 'applyManually']
           .map((id) => q(`[data-automation-id="${id}"]`)).find(isVisible);
         if (start) {
@@ -3767,14 +3913,21 @@
         }
         if (isSignInPage()) {
           setStatus('请先登录或创建账号（可用 Chrome 密码管理器），登录后会自动继续…');
-          await waitFor(() => !running || !isSignInPage(), 10 * 60 * 1000, 1000);
+          qOut('login', '要登录或创建 Workday 账号：' + location.hostname.split('.')[0]);
+          await waitFor(() => !running || !isSignInPage(), QUEUE ? 24 * 3600 * 1000 : 10 * 60 * 1000, 1000);
           await sleep(2000);
           continue;
         }
         const step = currentStep();
         if (!step) {
           setStatus('等待申请表加载…');
-          if (!(await waitFor(() => currentStep() || isSignInPage(), 15000, 500))) { setStatus('没找到申请表。请先打开职位页或申请页。'); break; }
+          if (!(await waitFor(() => currentStep() || isSignInPage(), 15000, 500))) {
+            const body = textOf(document.body).slice(0, 6000);
+            if (QUEUE && Q_CLOSED_RE.test(body)) { qOut('closed', '职位已关闭：' + body.match(Q_CLOSED_RE)[0]); break; }
+            if (QUEUE && Q_DUP_RE.test(body)) { qOut('dup', '页面说已经投过'); break; }
+            setStatus('没找到申请表。请先打开职位页或申请页。');
+            break;
+          }
           continue;
         }
         if (/review/i.test(step)) { await onReview(); break; }
@@ -3812,6 +3965,10 @@
       running = false;
       if (alive()) sessionStorage.removeItem(AUTO_KEY);
       renderPanel();
+      if (QUEUE && alive()) {
+        if (!qReported) qOut('stuck', statusText, missingList);
+        else if (['verify', 'captcha', 'ready'].includes(qLastState)) qWaitDone();
+      }
     }
   }
 
@@ -3838,7 +3995,7 @@
     if (!(appDetected || isWD())) return;
     const b = e.target.closest && e.target.closest('button, input[type="submit"], [role="button"]');
     if (!b) return;
-    if (isWD() ? /^submit( application)?$/i.test(textOf(b)) && /review/i.test(currentStep()) : SUBMIT_RE.test(buttonText(b))) addLog('已提交');
+    if (isWD() ? /^submit( application)?$/i.test(textOf(b)) && /review/i.test(currentStep()) : SUBMIT_RE.test(buttonText(b))) addLog(QUEUE ? '已点提交' : '已提交');
     if (!running && pending.length && b === findNextButton()) saveLearned(collectLearned());
   }, true);
 
@@ -4095,6 +4252,10 @@
       setStatus('继续自动流程…');
       await sleep(1500);
       runAuto();
+    } else if (QUEUE && !running) {
+      setStatus('批量队列：开始自动填写…');
+      await sleep(1500);
+      if (!running) runAuto();
     }
   }
 
@@ -4130,7 +4291,7 @@
     if (!alive()) { running = false; showStale(); clearInterval(timer); return; }
     if (panel && !panel.host.isConnected && (appDetected || isWD() || childState)) renderPanel();
     if (!appDetected && !isWD()) {
-      if (document.visibilityState === 'visible' && maybeApplication()) onDetected();
+      if ((document.visibilityState === 'visible' || QUEUE) && maybeApplication()) onDetected();
       return;
     }
     if (jobKey() !== lastJobKey) {
@@ -4147,8 +4308,14 @@
     booted = true;
     if (!IN_FRAME) { try { chrome.runtime.sendMessage({ type: 'devCheck' }); } catch (_) { /* ignore */ } }
     await loadState();
+    try {
+      if (document.prerendering) throw new Error('prerender');
+      const r = await new Promise((res) => { setTimeout(() => res(null), 2000); chrome.runtime.sendMessage({ type: 'queueHello' }, (x) => { void chrome.runtime.lastError; res(x); }); });
+      if (r && r.item) { QUEUE = r.item; QUEUE_SUBMIT = !!r.autoSubmit; dbg('批量队列任务', QUEUE); }
+    } catch (_) { /* 测试页 / 插件断开 */ }
     if (!IN_FRAME) for (const f of qa('iframe')) { try { f.contentWindow.postMessage({ __wdaf: 'cmd', cmd: 'ping' }, '*'); } catch (_) { /* ignore */ } }
     if (maybeApplication()) onDetected();
     else renderPanel(); // 不是申请页：什么都不做，等上面的定时检查
+    if (QUEUE && !IN_FRAME) queueDrive();
   })();
 })();

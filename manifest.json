@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "求职自动投递助手",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "在招聘网站上自动上传简历、按你的资料填写申请表、逐页推进，停在提交前。配合本机 Codex 可以补答新题、复核、写 cover letter。",
   "permissions": [
     "storage",
     "unlimitedStorage",
     "scripting",
     "nativeMessaging",
-    "debugger"
+    "debugger",
+    "alarms"
   ],
   "background": {
     "service_worker": "background.js"

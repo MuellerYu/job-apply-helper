@@ -7,6 +7,7 @@ const SCHEMA = [
     fields: [
       ['firstName', '名 First Name'],
       ['middleName', '中间名 Middle Name（可空）'],
+      ['preferredName', '常用名 Preferred Name（可空：平时用的英文名等；空着这类题就不填）'],
       ['lastName', '姓 Last Name'],
       ['email', '邮箱 Email'],
       ['phone', '电话 Phone Number'],
@@ -95,6 +96,8 @@ const SCHEMA = [
       ['confidentialInfo', '是否持有前雇主的机密信息 / 商业秘密（可能和新职位有关）', YES_NO],
       ['undergradSchool', '本科学校（英文全称，问本科学校时用）'],
       ['undergradSchoolAlt', '本科学校的另一种写法（列表里找不到全称时用）'],
+      ['undergradMajor', '本科专业（英文，问 undergrad major / discipline 时用）'],
+      ['undergradMajorAlt', '本科专业的其他写法（逗号隔开，列表里找不到时依次试）'],
       ['hometown', '家乡（如 Shanghai, China）'],
       ['hsGradYear', '高中毕业年份'],
       ['cpaPathway', 'CPA 资格路径（如 The traditional 150-credit hour pathway）'],

@@ -4,6 +4,7 @@
 const WDAF_DEFAULT_PROFILE = {
   // 基本信息
   firstName: '', middleName: '', lastName: '',
+  preferredName: '', // 常用名（英文名等）：填了就用在 Preferred / Nickname 题上，空着就不填
   email: '', phone: '', phoneType: 'Mobile', phoneOS: '', // 手机系统（iPhone / Android），电话类型题要分系统时用
   country: 'United States of America',
   address1: '', address2: '', city: '', state: '', postalCode: '',
@@ -30,7 +31,7 @@ const WDAF_DEFAULT_PROFILE = {
   // 以下留空 = 遇到这类题不自动答（标红留给你，或交给 Codex）
   smsConsent: '', currentlySponsored: '', interviewTravelAssist: '', everTerminated: '', plannedTimeOff: '',
   acceptPostedPay: '', politicalDonations: '', needAccommodation: '', hasSpouse: '', householdBoard: '', confidentialInfo: '', hourlyRate: '',
-  undergradSchool: '', undergradSchoolAlt: '', hometown: '', hsGradYear: '', cpaPathway: '', citizenship: '',
+  undergradSchool: '', undergradSchoolAlt: '', undergradMajor: '', undergradMajorAlt: '', hometown: '', hsGradYear: '', cpaPathway: '', citizenship: '',
   background: '', // 给 AI 看的背景补充（自由填写：身份、偏好、经历细节、不想答的事…），Codex 答题、写 cover letter 时会参考
   projects: [], // 项目 / 自己做的事（JSON，同 workHistory 的格式）
   enrolled: 'Yes', relocate: 'Yes', nonCompete: 'No', pastParticipation: 'No',
