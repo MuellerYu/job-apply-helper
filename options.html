@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>求职自动投递助手 · 设置</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <header>
+    <h1>求职自动投递助手</h1>
+    <p id="updateNote" class="update-note" hidden></p>
+    <p class="sub">填好一次资料，之后在招聘网站的申请页（Workday、Greenhouse、Lever、Jobvite 等）点右下角的面板即可自动填写。表单是英文的，所以资料请用英文填写。</p>
+  </header>
+
+  <main id="form"></main>
+
+  <section class="card">
+    <h2>简历（按职位自动选择）</h2>
+    <p class="hint">插件会读职位标题和职位描述：标题里出现关键词算 5 分，描述里出现算 1 分。别的简历要比「默认」那份高 2 分以上才会换，否则用默认的。在页面面板上也可以针对某个职位手动换。</p>
+    <div id="resumeList"></div>
+    <div id="transcriptRow" class="resume"></div>
+    <div class="row">
+      <button type="button" id="resumeAdd" class="ghost">+ 添加一份简历</button>
+      <button type="button" id="parseResume">用简历自动填写资料（Codex）</button>
+      <span id="parseStatus" class="hint"></span>
+    </div>
+    <div class="tester">
+      <input type="text" id="testTitle" placeholder="试一下：输入职位名称，比如 Internal Audit Summer Intern">
+      <div id="testResult" class="hint"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>AI（本机 Codex）</h2>
+    <p class="hint">插件答不了的题（新问题、作文题）和 cover letter，交给你电脑上的 Codex（ChatGPT 应用自带，用你自己的登录）。答过的题会记到下面的「自定义问答」里，下次不用再问。开关在上面「行为设置」里。</p>
+    <div class="row">
+      <button type="button" id="codexTest" class="ghost">测试连接</button>
+      <span id="codexStatus" class="hint"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Cover letter / writing sample 记录</h2>
+    <p class="hint">每次 Codex 写的 cover letter 和 writing sample 都在这里，最新的在上面。点「查看」打开 PDF。</p>
+    <div id="clList"></div>
+  </section>
+
+  <section class="card">
+    <h2>自定义问答</h2>
+    <p class="hint">Application Questions 每家公司都不一样。遇到插件没答的题，把关键词和答案加在这里，下次就会自动答。</p>
+    <textarea id="customRules" rows="9" spellcheck="false"></textarea>
+    <h3>Codex 猜的答案（待你确认）</h3>
+    <p class="hint">插件答不了的题，Codex 按你的资料答过、记了下来（上面文本框里行尾带 ⟨codex …⟩ 的那些）。它们排在内置规则后面，也不会当成「你确认过的答案」。点「确认」去掉标记，点「删掉」整行删除。</p>
+    <div id="guessList"></div>
+  </section>
+
+  <section class="card">
+    <h2>答卷记录</h2>
+    <p class="hint">每份申请每一页点「下一步」前，插件记下的题目和答案（最近 150 份，只存在本机）。点开看整份答卷。</p>
+    <div id="snapList"></div>
+  </section>
+
+  <section class="card">
+    <h2>投递记录</h2>
+    <div class="row">
+      <button type="button" id="exportCsv" class="ghost">导出 CSV</button>
+      <button type="button" id="clearLog" class="ghost danger">清空记录</button>
+      <span id="logCount" class="hint"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="logTable">
+        <thead><tr><th>时间</th><th>公司</th><th>职位</th><th>简历</th><th>状态</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>备份</h2>
+    <div class="row">
+      <button type="button" id="exportJson" class="ghost">导出全部设置</button>
+      <label class="ghost file-btn">导入设置<input type="file" id="importJson" accept=".json" hidden></label>
+    </div>
+  </section>
+
+  <footer>
+    <button type="button" id="save">保存</button>
+    <span id="toast"></span>
+  </footer>
+
+  <script src="defaults.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

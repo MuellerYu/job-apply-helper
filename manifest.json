@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "求职自动投递助手",
+  "version": "2.2.0",
+  "description": "在招聘网站上自动上传简历、按你的资料填写申请表、逐页推进，停在提交前。配合本机 Codex 可以补答新题、复核、写 cover letter。",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "scripting",
+    "nativeMessaging",
+    "debugger"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "求职自动投递助手：打开设置"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "all_frames": true,
+      "js": [
+        "defaults.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxJqoOy6qSwMz+NFm8YxVFtlpyMRI4eBLipsMyuM4esFP3xFlz8ETAEEX3uaDgRr0asAdVML1OtNlWtj60jT0AjQ5x6COVzeXuMXbLKDJZoBl1kIoXOVBqH+0fv19Cwnw24IWvYiqyiVW0Tu7ryRQ4BKbeGbTttoZN/9xov0gjZypuoYT3YUGjXVrYEVb0giU9/f0eWPAcsX8SrT66gdqqRUs16ecwpRKFfrEKHs/eK2q2WExsXRfdJk4LOD0ZS1OC4hRsBR4en9mjERpDrk42L+im/LyYZCjrqk0voz3zotgcHTA862evhhyDc+7kQaogbftTyusCYiQgUVh43qp2wIDAQAB"
+}

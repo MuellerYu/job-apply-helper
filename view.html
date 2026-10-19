@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>查看简历</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #f4f6f9; color: #1d2330;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+    body { display: flex; flex-direction: column; }
+    header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 10px 16px;
+      background: #fff; border-bottom: 1px solid #d5dae3; }
+    #t { font-weight: 600; font-size: 15px; }
+    #m { color: #687082; }
+    #dl { margin-left: auto; color: #0b6bcb; text-decoration: none; }
+    #dl[hidden] { display: none; }
+    iframe { display: block; border: 0; width: 100%; flex: 1; min-height: 0; background: #fff; }
+    .empty { padding: 40px 16px; color: #687082; }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="t">简历</span>
+    <span id="m"></span>
+    <a id="dl" hidden>下载</a>
+  </header>
+  <iframe id="f" title="简历内容"></iframe>
+  <script src="defaults.js"></script>
+  <script src="view.js"></script>
+</body>
+</html>
