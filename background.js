@@ -16,8 +16,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   const liveDoc = sender && sender.tab && (!sender.documentLifecycle || sender.documentLifecycle === 'active');
-  if (msg && msg.type === 'queueHello' && sender && sender.tab) { if (!liveDoc) { sendResponse({ item: null }); return; } qHello(sender.tab.id).then(sendResponse); return true; }
+  if (msg && msg.type === 'queueHello' && sender && sender.tab) { if (!liveDoc) { sendResponse({ item: null }); return; } qHello(sender.tab.id, [sender.tab.url, sender.url]).then(sendResponse); return true; }
   if (msg && msg.type === 'queueReport' && sender && sender.tab) { if (!liveDoc) { sendResponse({ ok: false }); return; } qReport(sender.tab.id, msg).then(sendResponse, (e) => sendResponse({ ok: false, error: String(e) })); return true; }
+  if (msg && msg.type === 'jobDone') {
+    (async () => {
+      const keys = new Set((msg.urls || []).filter((u) => /^https?:/.test(u || '')).map(qUrlKey));
+      const { log = [] } = await chrome.storage.local.get('log');
+      const r = log.find((x) => Q_DONE_LOG.test(x.status || '') && x.url && keys.has(qUrlKey(x.url)));
+      sendResponse(r ? { done: true, status: r.status, when: new Date(r.time || 0).toLocaleString('zh-CN', { hour12: false }) } : { done: false });
+    })();
+    return true;
+  }
+  if (msg && msg.type === 'startAllTabs') {
+    (async () => {
+      const tabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] }).catch(() => []);
+      let sent = 0;
+      for (const t of tabs) {
+        const r = await new Promise((res) => chrome.tabs.sendMessage(t.id, { type: 'wdafStartAll' }, { frameId: 0 }, (x) => { void chrome.runtime.lastError; res(x); }));
+        if (r && r.started) sent++;
+      }
+      sendResponse({ sent });
+    })();
+    return true;
+  }
   if (msg && msg.type === 'queueCmd') { qCmd(msg, sender).then(sendResponse, (e) => sendResponse({ ok: false, error: String(e) })); return true; }
   if (msg && msg.type === 'armChooser' && sender && sender.tab && msg.path) { armChooser(sender.tab.id, msg.path).then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) })); return true; }
   if (msg && msg.type === 'sleep') { setTimeout(() => sendResponse(true), Math.min(Math.max(Number(msg.ms) || 0, 0), 60000)); return true; }
@@ -329,9 +350,26 @@ function qTx(fn) {
   return run;
 }
 
+function qGhId(x) {
+  const p = x.searchParams;
+  const jid = p.get('gh_jid') || '';
+  if (/^\d{5,}$/.test(jid)) return jid;
+  if (/(^|\.)greenhouse\.io$/.test(x.hostname)) {
+    const tok = p.get('token') || '';
+    if (/\/embed\/job_app/.test(x.pathname) && /^\d{5,}$/.test(tok)) return tok;
+    const m = x.pathname.match(/\/jobs\/(\d{5,})/);
+    if (m) return m[1];
+  }
+  return '';
+}
+
 function qUrlKey(u) {
   try {
     const x = new URL(u);
+    const gh = qGhId(x);
+    if (gh) return 'greenhouse:' + gh;
+    const pl = /(^|\.)paylocity\.com$/i.test(x.hostname) && x.pathname.match(/\/jobs\/(?:apply|details)\/(\d+)/i);
+    if (pl) return 'paylocity:' + pl[1];
     return (x.hostname + x.pathname.replace(/^\/[a-z]{2}-[A-Z]{2}(?=\/)/, '').replace(/\/(confirmation|thank-?you|thanks|success|submitted|application-?complete)\/?$/i, '')
       .replace(/\/(apply|application)(\/.*)?$/, '').replace(/\/$/, '')).toLowerCase();
   } catch (_) { return String(u || '').toLowerCase(); }
@@ -339,10 +377,61 @@ function qUrlKey(u) {
 
 const qFind = (Q, tabId) => Q.items.find((x) => x.tabId === tabId && ['running', 'resumed', 'needs'].includes(x.status));
 
-async function qHello(tabId) {
+const Q_DONE_LOG = /已提交|已点提交/;
+async function qAlreadyDone(Q, it, urls) {
+  const keys = new Set(urls.filter((u) => /^https?:/.test(u || '')).map(qUrlKey).filter(Boolean));
+  if (!keys.size) return '';
+  const { log = [] } = await chrome.storage.local.get('log');
+  if (log.some((r) => Q_DONE_LOG.test(r.status || '') && (r.time || 0) < (it.started || Date.now()) && keys.has(qUrlKey(r.url)))) return '投递记录里已提交过（跳转后认出）';
+  for (const x of Q.items) {
+    if (x.id === it.id) continue;
+    const same = (x.url && keys.has(qUrlKey(x.url))) || (x.lastUrl && /^(greenhouse|paylocity):/.test(qUrlKey(x.lastUrl)) && keys.has(qUrlKey(x.lastUrl)));
+    if (!same) continue;
+    if (x.status === 'submitted' || x.status === 'dup') return '队列里同一个职位已经投过（跳转后认出）';
+    if (x.tabId && ['running', 'resumed', 'needs'].includes(x.status)) return '另一个标签页在投同一个职位';
+  }
+  return '';
+}
+
+async function qSyncFromLog() {
+  const { log = [] } = await chrome.storage.local.get('log');
+  const done = new Map();
+  for (const r of log) if (Q_DONE_LOG.test(r.status || '') && r.url) done.set(qUrlKey(r.url), r);
+  if (!done.size) return 0;
+  return qTx((Q) => {
+    let n = 0;
+    for (const it of Q.items) {
+      if (!['pending', 'needs', 'stuck'].includes(it.status) || it.force) continue;
+      if (it.tabId && it.status === 'needs') continue; // 队列自己开着的标签页在等你，交了它自己会回报
+      const r = done.get(qUrlKey(it.url)) || (it.lastUrl && done.get(qUrlKey(it.lastUrl)));
+      if (!r) continue;
+      Object.assign(it, { status: 'submitted', note: '队列外提交（' + r.status + '）', ended: r.time || Date.now() });
+      n++;
+    }
+    return n;
+  });
+}
+let qSyncTimer = null;
+chrome.storage.onChanged.addListener((ch, area) => {
+  if (area !== 'local' || !ch.log) return;
+  clearTimeout(qSyncTimer);
+  qSyncTimer = setTimeout(() => qSyncFromLog().catch((e) => console.warn('[投递队列] 同步提交记录', e)), 1500);
+});
+setTimeout(() => qSyncFromLog().catch(() => {}), 3000);
+
+async function qHello(tabId, urls = []) {
   const Q = await qGet();
   const it = qFind(Q, tabId);
   if (!it) return { item: null };
+  if (it.status === 'running' && !it.submitAt && !it.force) {
+    const why = await qAlreadyDone(Q, it, urls);
+    if (why) {
+      await qTx((Q2) => { const x = Q2.items.find((y) => y.id === it.id); if (x) Object.assign(x, { status: 'dup', note: why, ended: Date.now(), tabId: null }); });
+      setTimeout(() => chrome.tabs.remove(tabId).catch(() => {}), 800);
+      setTimeout(qNext, 2000);
+      return { item: null };
+    }
+  }
   return { item: { id: it.id, url: it.url, company: it.company, title: it.title, resume: it.resume, hops: it.hops || 0, status: it.status, need: it.need || '', submitAt: it.submitAt || 0 }, autoSubmit: !!Q.meta.autoSubmit };
 }
 
@@ -368,7 +457,7 @@ async function qReport(tabId, m) {
     it.note = String(m.note || '').slice(0, 400);
     if (Array.isArray(m.missing)) it.missing = m.missing.slice(0, 8).map((s) => String(s).slice(0, 80));
     it.ended = now;
-    if (st === 'submitted' || st === 'dup' || st === 'closed') {
+    if (st === 'submitted' || st === 'dup' || st === 'closed' || st === 'ineligible') {
       it.status = st;
       it.need = '';
       const close = it.tabId;
@@ -412,7 +501,7 @@ async function qNext() {
       if (M.preferHost && it.host !== M.preferHost) M.preferHost = '';
       Object.assign(it, { status: 'running', started: Date.now(), progress: Date.now(), hops: 0, need: '', note: '', missing: [], tries: (it.tries || 0) + 1 });
       if (Q_LOGIN_ATS.has(it.ats)) busy.add(it.host);
-      out.push({ id: it.id, url: it.url });
+      out.push({ id: it.id, url: it.url, force: !!it.force });
     }
     if (!out.length && !running.length) {
       const left = Q.items.some((x) => x.status === 'pending');
@@ -428,7 +517,7 @@ async function qOpen(pick) {
   const setItem = (patch) => qTx((Q) => { const it = Q.items.find((x) => x.id === pick.id); if (it) Object.assign(it, patch); });
   const { log = [] } = await chrome.storage.local.get('log');
   const key = qUrlKey(pick.url);
-  if (log.some((r) => r.status === '已提交' && qUrlKey(r.url) === key)) {
+  if (!pick.force && log.some((r) => Q_DONE_LOG.test(r.status || '') && qUrlKey(r.url) === key)) {
     await setItem({ status: 'dup', note: '投递记录里已提交过', ended: Date.now() });
     setTimeout(qNext, 500);
     return;
@@ -438,7 +527,7 @@ async function qOpen(pick) {
     let win = M.windowId ? await chrome.windows.get(M.windowId).catch(() => null) : null;
     let tabId;
     if (win) {
-      tabId = (await chrome.tabs.create({ windowId: win.id, url: 'about:blank', active: true })).id;
+      tabId = (await chrome.tabs.create({ windowId: win.id, url: 'about:blank', active: false })).id;
       if (M.groupId != null) await chrome.tabs.group({ groupId: M.groupId, tabIds: tabId }).catch(() => qTx((Q2) => { Q2.meta.groupId = null; }));
     } else {
       win = await chrome.windows.create({ url: 'about:blank', focused: false, width: 1300, height: 950 });
@@ -521,6 +610,32 @@ async function qTick() {
   if (Q.meta.running) qNext();
 }
 
+function qUrlCompany(u) {
+  try {
+    const x = new URL(u);
+    const h = x.hostname.toLowerCase();
+    const seg = x.pathname.split('/').filter(Boolean);
+    if (/(^|\.)greenhouse\.io$/.test(h)) { const f = x.searchParams.get('for'); if (f) return 'gh:' + f.toLowerCase(); if (seg[0] && seg[0] !== 'embed') return 'gh:' + seg[0].toLowerCase(); return ''; }
+    if (h === 'jobs.lever.co' && seg[0]) return 'lever:' + seg[0].toLowerCase();
+    if (h === 'jobs.ashbyhq.com' && seg[0]) return 'ashby:' + seg[0].toLowerCase();
+    if (/smartrecruiters\.com$/.test(h)) { const i = seg.indexOf('company'); const c = i >= 0 ? seg[i + 1] : seg[0]; return c && !/^oneclick-ui$/i.test(c) ? 'sr:' + c.toLowerCase() : ''; }
+    if (/myworkdayjobs\.com$|myworkdaysite\.com$/.test(h)) return 'wd:' + (h.split('.')[0] === 'wd1' || h.split('.')[0] === 'wd5' ? (seg[1] || '') : h.split('.')[0]);
+    if (/oraclecloud\.com$/.test(h)) return 'oracle:' + h.split('.')[0];
+    if (/icims\.com$/.test(h)) return 'icims:' + h.split('.')[0].replace(/^careers-/, '');
+    if (/rippling\.com$/.test(h) && seg[0]) return 'rippling:' + seg[0].toLowerCase();
+    return '';
+  } catch (_) { return ''; }
+}
+function qCompanyKeyer(items) {
+  const parent = new Map();
+  const find = (a) => { while (parent.has(a) && parent.get(a) !== a) a = parent.get(a); return a; };
+  const union = (a, b) => { if (!a || !b) return; const ra = find(a), rb = find(b); if (!parent.has(ra)) parent.set(ra, ra); if (!parent.has(rb)) parent.set(rb, rb); if (ra !== rb) parent.set(rb, ra); };
+  const name = (x) => { const n = String(x.company || '').toLowerCase().replace(/[^a-z0-9]/g, ''); return n ? 'co:' + n : 'host:' + x.host; };
+  for (const x of items) for (const u of [x.url, x.lastUrl]) { const k = u && qUrlCompany(u); if (k) union(name(x), k); }
+  return (x) => find(name(x));
+}
+
+const Q_UNSUPPORTED = /^$/;
 async function qImport(data) {
   if (!data) {
     const r = await fetch(chrome.runtime.getURL('queue-import.json'), { cache: 'no-store' }).catch(() => null);
@@ -544,7 +659,8 @@ async function qImport(data) {
       if (old) { Object.assign(old, { url: r.url, company: r.company, title: r.title, loc: r.loc, resume: r.resume, prio: r.prio, ats: r.ats, host: r.host }); out.push(old); by.delete(r.id); }
       else {
         const was = doneKeys.get(k);
-        out.push({ ...r, status: was ? 'dup' : 'pending', note: was ? '投递记录：' + was : '' });
+        const unsupported = !was && Q_UNSUPPORTED.test(String(r.url || '') + ' ' + String(r.ats || ''));
+        out.push({ ...r, status: was ? 'dup' : unsupported ? 'skipped' : 'pending', note: was ? '投递记录：' + was : unsupported ? '插件暂不支持这个招聘系统（SmartRecruiters 新版申请页）' : '' });
         fresh.add(r.id);
         added++;
       }
@@ -554,7 +670,7 @@ async function qImport(data) {
     const cap = Number(data.perCompany) || 0;
     let list = out;
     if (cap) {
-      const ck = (x) => String(x.company || '').toLowerCase().replace(/[^a-z0-9]/g, '') || x.host;
+      const ck = qCompanyKeyer(out);
       const used = {};
       for (const x of out) if (x.status !== 'pending' && x.status !== 'skipped') used[ck(x)] = (used[ck(x)] || 0) + 1;
       const keep = new Set();
@@ -618,8 +734,9 @@ async function qCmd(m, sender) {
     const n = await qTx((Q) => {
       let k = 0;
       for (const it of Q.items) {
-        if (it.status !== 'needs' || it.tabId || !needs.has(it.need) || (m.ids && !m.ids.includes(it.id)) || (m.host && it.host !== m.host)) continue;
-        Object.assign(it, { status: 'pending', need: '' });
+        const forced = m.force && m.ids && m.ids.includes(it.id) && it.status === 'dup' && !it.tabId;
+        if (!forced && (it.status !== 'needs' || it.tabId || !needs.has(it.need) || (m.ids && !m.ids.includes(it.id)) || (m.host && it.host !== m.host))) continue;
+        Object.assign(it, { status: 'pending', need: '', note: '', ...(forced ? { force: true } : {}) });
         k++;
       }
       return k;
@@ -644,7 +761,14 @@ async function qCmd(m, sender) {
     return qSummary();
   }
   if (c === 'skip' || c === 'unskip') {
-    await qTx((Q) => { for (const it of Q.items) if ((m.ids || []).includes(it.id) && it.status !== 'running') it.status = c === 'skip' ? 'skipped' : 'pending'; });
+    const re = m.match ? new RegExp(m.match, 'i') : null;
+    let n = 0;
+    await qTx((Q) => { for (const it of Q.items) if (((m.ids || []).includes(it.id) || (re && re.test(String(it.url || '') + ' ' + String(it.ats || '')) && it.status === (c === 'skip' ? 'pending' : 'skipped'))) && it.status !== 'running') { it.status = c === 'skip' ? 'skipped' : 'pending'; if (c === 'unskip') it.note = ''; n++; } });
+    return { ...(await qSummary()), changed: n };
+    
+  }
+  if (c === 'submitted') {
+    await qTx((Q) => { for (const it of Q.items) if ((m.ids || []).includes(it.id) && it.status !== 'running') Object.assign(it, { status: 'submitted', need: '', note: m.note || '你确认已提交', ended: it.ended || Date.now(), tabId: null }); });
     return qSummary();
   }
   if (c === 'focus' && m.id) {

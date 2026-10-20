@@ -43,6 +43,7 @@ $('#needs').addEventListener('click', async (e) => {
   refresh();
 });
 $('#start').onclick = async () => { await cmd('start'); refresh(); };
+$('#startAll').onclick = () => chrome.runtime.sendMessage({ type: 'startAllTabs' }, (r) => { void chrome.runtime.lastError; $('#startAll').textContent = `已让 ${(r && r.sent) || 0} 个申请页开始`; setTimeout(() => { $('#startAll').textContent = '所有申请页一起开始'; }, 4000); });
 $('#pause').onclick = async () => { await cmd('pause'); refresh(); };
 $('#stop').onclick = async () => { await cmd('stop'); refresh(); };
 $('#retry').onclick = async () => { const r = await cmd('retry'); $('#importStatus').textContent = `放回待投 ${r.retried || 0} 个`; refresh(); };
