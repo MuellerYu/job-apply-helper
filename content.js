@@ -8,7 +8,7 @@
   document.querySelectorAll('#wdaf-host').forEach((h) => h.remove());
 
   const AUTO_KEY = 'wdaf-auto-running';
-  const BUILD = '2026-10-20.291'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
+  const BUILD = '2026-10-20.318'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
   let QUEUE = null;
   let QUEUE_SUBMIT = false; // 队列设置：填完自动提交
   const sleep = (ms) => new Promise((r) => {
@@ -22,6 +22,7 @@
   const q = (sel, root = document) => root.querySelector(sel);
   const qa = (sel, root = document) => [...root.querySelectorAll(sel)];
   const isSR = () => /(^|\.)smartrecruiters\.com$/i.test(location.hostname);
+  const isPinpoint = () => /(^|\.)pinpointhq\.com$/i.test(location.hostname);
   function shadowQa(sel) {
     const out = [];
     const walk = (root) => { for (const el of root.querySelectorAll('*')) if (el.shadowRoot) { out.push(...el.shadowRoot.querySelectorAll(sel)); walk(el.shadowRoot); } };
@@ -191,6 +192,10 @@
     const i = log.findIndex((r) => r.url === url);
     if (i >= 0) log[i] = { ...log[i], ...entry };
     else log.push(entry);
+    if (status === '提交被拒') {
+      const base = (u) => String(u || '').replace(/\/applications(\/new)?\/?$/, '');
+      for (const r of log) if (r !== log[i] && r.status === '已点提交' && base(r.url) === base(url)) r.status = '提交被拒';
+    }
     await chrome.storage.local.set({ log });
   }
 
@@ -271,7 +276,7 @@
       for (let k = 0; k < 3 && sib; k++, sib = sib.previousElementSibling) {
         if (sib.matches('script, style, template, noscript')) { k--; continue; } // 页面脚本的文字不是题目（JazzHR 读成了「window.resumeRequired = true」）
         if (sib.matches('input, select, textarea, button') || q('input, select, textarea', sib)) break;
-        const t = labelText(sib);
+        const t = String(labelText(sib) || '').replace(/SVGs? (are )?not supported by this browser\.?/gi, '').trim();
         if (t && t.length <= 400 && !(skip && skip.test(cleanLabel(t)))) return { el: sib, text: t };
       }
       node = node.parentElement;
@@ -318,6 +323,23 @@
     if (!isChoice && !(el.labels && el.labels.length) && ownAria && !el.closest('[data-automation-id^="formField"]')
       && !/^[-—–\s]*type to search/i.test(ownAria) && !DATE_PART_RE.test(cleanLabel(ownAria))) cands.push(ownAria);
     const fs = el.closest('fieldset');
+    if (!isChoice && !(el.labels && el.labels.length) && !cands.length) {
+      let p = el.parentElement;
+      for (let k = 0; k < 6 && p && p !== fs && p !== document.body; k++, p = p.parentElement) {
+        if (qa('input, select, textarea', p).filter((c) => c.type !== 'hidden' && isVisible(c)).length > 1) break;
+        const l = [...p.children].find((c) => c.tagName === 'LABEL' && !c.htmlFor && textOf(c));
+        if (l) { cands.push(textOf(l)); break; }
+      }
+    }
+    if (isChoice && el.name && !cands.length && !el.closest('[data-automation-id^="formField"]')) {
+      let p = el.parentElement;
+      for (let k = 0; k < 6 && p && p !== fs && p !== document.body; k++, p = p.parentElement) {
+        if (qa('input, select, textarea', p).some((c) => c.type !== 'hidden' && isVisible(c) && c.name !== el.name)) break;
+        const l = [...p.children].find((c) => c.tagName === 'LABEL' && !c.contains(el) && textOf(c)
+          && !/^(radio|checkbox)$/.test(((c.htmlFor && document.getElementById(c.htmlFor)) || {}).type || ''));
+        if (l) { cands.push(textOf(l)); break; }
+      }
+    }
     if (fs) cands.push(textOf(q('legend', fs)));
     const ff = el.closest('[data-automation-id^="formField"]');
     if (ff) {
@@ -470,6 +492,7 @@
     { re: /sponsor|visa status|h-?1b/, key: 'needSponsorship', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /\b(16|18) years|age of (16|18)|at least (16|18)|over (16|18)\b/, key: 'over18' }, // Hy-Vee 问的是「at least 16」
     { re: /undergrad\w*.{0,40}(gpa|grade point)|(gpa|grade point).{0,40}undergrad|bachelor'?s?\b.{0,30}(gpa|grade point)/, key: 'undergradGpa' },
+    { re: /(accounting|auditing|major|in-major)\s+(gpa|grade point)/, key: 'undergradGpa' },
     { re: /standardi[sz]ed test|which (standardi[sz]ed )?(test|exam)s? (have you|did you) take|test you have taken/, key: 'stdTest', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /composite score|^(math|quant\w*|verbal|reading|writing|critical reasoning)( ?\/ ?[\w ]+)? score|\b(sat|act|gmat|gre) (total |composite )?(score|percentile)/, key: 'stdTestScore', kinds: [...PICK, 'radio'] },
     { re: /(end|graduation|completion) (date )?month|^to month/, key: 'eduEndMonthName', kinds: PICK },
@@ -481,12 +504,12 @@
     { re: /degree (granted|conferred|awarded|completed)|have you (graduated|completed your degree)/, key: 'degreeGranted' },
     { re: /level of education you are (currently )?(completing|pursuing)|current level of education|(degree|education)( level)? (that )?(you are|you're) currently (pursuing|enrolled in|working (on|towards?)|completing|obtaining|seeking)/, key: 'degree', kinds: PICK },
     { re: /graduation (date|year|month|term|semester)|(expected|anticipated) (date of )?graduation|when (do|will) you (expect to )?graduate|expect(ed|ing)? to graduate|graduat\w* (date|year)/, key: 'gradDate', kinds: [...PICK, 'text'] },
-    { re: /^(?!.*(highest|complet|attain|obtain)).*((degree|education)\b.{0,30}pursu|(education|degree|academic) level|level of (education|degree|study)|degree type|class standing|year in school|year of study)/, key: 'degree', kinds: PICK },
+    { re: /^(?!.*(highest|complet|attain|obtain)).*((degree|education)\b.{0,30}pursu|(education|degree|academic) level|level of (education|degree|study)|degree type|class standing|year in school|year of study|student (classification|standing|level))/, key: 'degree', kinds: [...PICK, 'radio', 'checkgroup'] }, // Aramco「What will your student classification be in Summer 2027?」；Paylocity 筛选题「Please select your currently enrolled degree type.」是多选框（Associates / Bachelors / Masters / PhD）
     { re: /(school|university|college|institution)\b.{0,60}\bundergrad(uate)? (studies|degree|education)|undergrad(uate)? (school|university|college|institution)/, key: 'undergradSchool', kinds: [...PICK, 'text'] },
     { re: /undergrad\w*.{0,30}(major|discipline|field|area of study|concentration)|(major|discipline|field of study|area of study).{0,30}undergrad|bachelor'?s?( degree)?.{0,20}(major|discipline|field of study)/, key: 'undergradMajor' },
     { re: /(list|name|enter|provide|what is|which)( the| your)? (name of (the |your )?)?(university|college|school|institution)( you are| you're)? (currently )?(attend|enrolled|studying)|(university|college|school) you are currently attending/, key: 'school', kinds: TEXTISH },
     { re: /^name of (your )?(current )?(school|university|college|institution)$|^(current )?(school|university|college) name$/, key: 'school', kinds: [...TEXTISH, ...PICK] },
-    { re: /class standing|year in school|academic (standing|level|year)/, key: 'classStanding', kinds: TEXT },
+    { re: /class standing|year in school|academic (standing|level|year)|student classification/, key: 'classStanding', kinds: TEXT },
     { re: /^(where|at which (school|university|college|institution)|which (school|university|college|institution)) (are|do) you (currently )?(pursu|attend|stud|enrol)/, key: 'school', kinds: TEXTISH },
     { re: /^(what|which) (college|university|school|institution)( ?(or|\/) ?(college|university|school))? (are|do|will) you (currently |now )?(attend|enrol|stud|pursu)/, key: 'school', kinds: [...TEXTISH, ...PICK] }, // D.A. Davidson「What College/University are you currently attending?」是下拉
     { re: /total military experience|years of (military|active duty) (service|experience)|how (long|many years) (have|did) you serve/, key: 'militaryYears', kinds: [...PICK, 'radio'] },
@@ -528,6 +551,7 @@
     { re: /(may|can) we contact (your )?(current|present) employer|contact (your )?(current|present) employer/, key: 'contactCurrentEmployer', kinds: [...PICK, 'radio'] },
     { re: /(do you (currently )?have|have you (already )?(secured|arranged|made|found)|already (have|secured)) (\w+ ){0,2}(housing|accommodation|a place to (live|stay))/, key: 'NO' }, // 文字框也答（Consigli「Do you have housing in the area where you are applying?」）
     { re: /(reliable|own|dependable) (means of )?transportation|transportation to (and from )?(the )?(office|job ?site|work)/, key: 'YES' },
+    { re: /(do you (have|own)|have access to) (your own |a |an )?(personal |own )?(laptop|computer|pc)\b/, key: 'YES', kinds: [...PICK, 'radio'] },
     { re: /(willing|able|plan|prepared) to (arrange|secure|find|provide|cover) (for )?(your |my )?own (housing|accommodation|lodging)|responsible for (your |my )?own (housing|accommodation|lodging)/, key: 'YES', kinds: [...PICK, 'radio'] },
     { re: /(willing|agree|consent|able|prepared) to (submit to|undergo|complete|pass|take|participate in)( a| an| the)?( pre-?employment| standard)? (background|criminal|drug|credit)|(background (check|screen\w*|investigation)|drug (test|screen\w*)).{0,40}\b(willing|agree|consent)\b/, key: 'YES', kinds: [...PICK, 'radio'] },
     { re: /meet (all (of )?)?the (minimum|basic|required|stated) (qualifications|requirements)|minimum qualifications/, key: 'essentialFunctions' }, // 是否满足最低任职要求
@@ -549,7 +573,7 @@
     { re: /github/, key: 'github', kinds: TEXT, self: true },
     { re: /website|portfolio|personal url/, key: 'website', kinds: TEXT, self: true },
     { re: /location of (the )?(institution|school|university|college)|(institution|school|university|college) location/, key: 'schoolLocation', kinds: TEXTISH },
-    { re: /^(?!.*\blocation\b).*(school|university|college|institution)/, key: 'school', kinds: [...TEXTISH, 'popcombo'] }, // Jane Street 的学校是 role=button 自制下拉
+    { re: /^(?!.*\b(location|gpa|grade point)\b).*(school|university|college|institution)/, key: 'school', kinds: [...TEXTISH, 'popcombo'] }, // Jane Street 的学校是 role=button 自制下拉
     { re: /^degree(?!.*(major|field|discipline|subject|concentration|area|granted|conferred|awarded))|degree (type|level|obtained|earned)/, key: 'degree' },
     { re: /gpa|grade point|overall result/, key: 'gpa', kinds: [...TEXT, ...PICK] },
     { re: /languages? (fluency|proficiency)|languages? .{0,60}(fluen|business-level|proficien)|which languages/, key: 'languageList', kinds: [...PICK, 'checkgroup'] },
@@ -1111,8 +1135,8 @@
       if (t === 'radio' || t === 'checkbox') {
         const box = el.closest('fieldset, [role="radiogroup"], [role="group"], [data-automation-id^="formField"]');
         const sib = t === 'checkbox' && el.name && el.name.match(/^(.+?)[-_](\d{1,2})$/);
-        const sibKey = sib && el.form && qa(`input[type="checkbox"][name^="${CSS.escape(sib[1])}"]`, el.form).filter((x) => new RegExp('^' + sib[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[-_]\\d{1,2}$').test(x.name)).length > 1 ? 'c:' + sib[1] : '';
-        const gkey = t === 'radio' && el.name ? 'r:' + el.name : box || (t === 'checkbox' && el.name && el.form && el.form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(el.name)}"]`).length > 1 ? 'c:' + el.name : sibKey || el);
+        const sibKey = sib && qa(`input[type="checkbox"][name^="${CSS.escape(sib[1])}"]`, el.form || document).filter((x) => new RegExp('^' + sib[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[-_]\\d{1,2}$').test(x.name)).length > 1 ? 'c:' + sib[1] : '';
+        const gkey = t === 'radio' && el.name ? 'r:' + el.name : box || (t === 'checkbox' && el.name && (el.form || document).querySelectorAll(`input[type="checkbox"][name="${CSS.escape(el.name)}"]`).length > 1 ? 'c:' + el.name : sibKey || el); // Paylocity 筛选题的多选框不在 <form> 里（「In which location(s) are you interested in?」5 个框被当成 5 道题）
         if (!groups.has(gkey)) groups.set(gkey, { kind: t, els: [] });
         groups.get(gkey).els.push(el);
         continue;
@@ -1155,6 +1179,11 @@
         if (ac.matches('[data-test="location-autocomplete"], [label="City"]') || !ac.offsetWidth) continue; // 第 1 页的城市 srCity 管
         const inp = ac.shadowRoot && srDeep(ac.shadowRoot, 'input').find((i) => isVisible(i));
         if (inp) fields.push({ kind: 'combo', el: inp, srAc: ac, srQ: srHostLabel(ac), srReq: ac.hasAttribute('required') });
+      }
+      for (const ac of shadowQa('spl-multiselect-autocomplete')) {
+        if (!ac.offsetWidth) continue;
+        const inp = ac.shadowRoot && srDeep(ac.shadowRoot, 'input').find((i) => isVisible(i));
+        if (inp) fields.push({ kind: 'combo', el: inp, srAc: ac, srMulti: true, srQ: srHostLabel(ac), srReq: ac.hasAttribute('required') });
       }
     }
     for (const g of groups.values()) {
@@ -1202,7 +1231,10 @@
         legendHit = textOf(fs.querySelector(':scope > legend')).match(/^(employment|work) (history|experience)\s*[#(]?\s*(\d+)\)?/i);
       }
       const eh = !isWD() && (legendHit || precedingHeading(f.el).match(/^(employment|work) (history|experience)\s*[#(]?\s*(\d+)\b/i));
+      const ppFs = isPinpoint() && f.el.closest('fieldset');
+      const ppEmp = ppFs && /^\d+\.\s*(employment|work) (history|experience)/i.test(textOf(ppFs.querySelector(':scope > legend')));
       if (eh) { block = 'employer'; empIdx = Number(eh[3]) - 1; byHeading = true; }
+      else if (ppEmp) { block = 'employer'; empIdx = 0; byHeading = true; }
       else if (byHeading) { block = ''; empIdx = null; byHeading = false; }
       if (isWD()) { // Workday：看区块标题
         const h = precedingHeading(f.el);
@@ -1560,6 +1592,7 @@
     if (!els.length) els = qa('[role="row"]', root).filter((r) => !q('[role="columnheader"]', r)).map((r) => q('[role="gridcell"]', r) || r);
     if (!els.length) els = qa('[role="listitem"]', root); // Paylocity 的下拉：div[role=list] > div[role=listitem]
     if (!els.length) els = qa('li', root);
+    if (!els.length) els = qa('[class*="__option"], [id*="-option-"]', root);
     return els;
   }
   function newPopups(input) {
@@ -1812,6 +1845,38 @@
     return /^(\(\w+\)\s*)?if (the answer is |you answered |your answer is )?["“']?yes\b|please (list|write|enter|type|put) ["“']?n\/?a\b|if not applicable,? (please )?(put|write|enter|type) ["“']?n\/?a\b/.test(qn) ? { value: 'N/A' } : null;
   }
 
+  function pinpointDatePart(f) {
+    const m = f.kind === 'select' && String(f.el.name || '').match(/date_(from|to)_answer_([123])i\]?$/);
+    return m ? { to: m[1] === 'to', part: { 1: 'year', 2: 'month', 3: 'day' }[m[2]] } : null;
+  }
+  function dateParts(part, month, year) {
+    if (part === 'day') return { value: '1', alts: ['1', '01'] };
+    if (part === 'month') return month ? { value: monthCands(month)[0], alts: monthCands(month) } : null;
+    if (part === 'year') return year ? { value: String(year) } : null;
+    return null;
+  }
+  function pinpointWorkDate(f) {
+    const d = isPinpoint() && f.block === 'employer' && pinpointDatePart(f);
+    const job = d && (Array.isArray(S.profile.workHistory) ? S.profile.workHistory : [])[f.empIdx || 0];
+    if (!job || (d.to && job.current)) return null;
+    const mm = String((d.to ? job.end : job.start) || '').match(/^(\d{1,2})\/(\d{4})$/);
+    return mm ? dateParts(d.part, mm[1], mm[2]) : null;
+  }
+  function pinpointEduAnswer(f) {
+    const fs = isPinpoint() && f.el.closest('fieldset');
+    if (!fs || !/^\d+\.\s*education/i.test(textOf(fs.querySelector(':scope > legend')))) return null;
+    const P = S.profile;
+    const qq = norm(f.question);
+    if (f.kind === 'checkbox') return /still (studying|study|enrolled|attending)/.test(qq) ? { value: 'CHECK' } : null;
+    const d = pinpointDatePart(f);
+    if (d) return dateParts(d.part, d.to ? P.eduEndMonth : P.eduStartMonth, d.to ? P.eduEndYear : P.eduStartYear);
+    if (/institut|school|university|college/.test(qq)) return P.school ? { value: P.school } : null;
+    if (/level|degree|qualification/.test(qq)) return P.degreeFull || P.degree ? { value: P.degreeFull || P.degree } : null;
+    if (/^course|subject|major|field/.test(qq)) return P.fieldOfStudy ? { value: P.fieldOfStudy } : null;
+    if (/^grade|gpa/.test(qq)) return P.gpa ? { value: String(P.gpa) } : null;
+    return null;
+  }
+
   function workAnswer(f) {
     if (f.block !== 'employer' || f.empIdx == null) return null;
     const jobs = Array.isArray(S.profile.workHistory) ? S.profile.workHistory : [];
@@ -1839,6 +1904,7 @@
     else if (/start date|date started|^from\b|start \(/.test(q)) return part(job.start);
     else if (/end date|date (ended|left)|^to\b|end \(/.test(q)) return job.current ? (/month|year/.test(q) ? null : { value: 'Present' }) : part(job.end);
     else if (/job title|position title|^title$|^position$/.test(q)) v = job.title;
+    else if (/^may we contact|contact (this|the) employer|ok to contact|permission to contact/.test(q)) { if (job.current) return null; v = 'Yes'; }
     else if (/^country\b/.test(q)) { v = job.country || (/china/i.test(job.location || '') ? 'China' : null); return v ? { value: v, empAddr: true, first: true } : null; } // 先填国家：改了会刷新下面的地址栏
     else if (/^(state|province|region|administrative area)\b/.test(q)) addr = v = (/administrative area/.test(q) && job.adminArea) || job.state || (/china/i.test(job.country || job.location || '') ? job.city : null) || null; // Paylocity「Administrative Area」：资料里该雇主的 adminArea（区）；没有就按国家：中国的公司没有州，填城市（直辖市）
     else if (/^county\b/.test(q)) addr = v = job.county || null;
@@ -1914,7 +1980,7 @@
 
   function ackAnswer(f) {
     if (!S.settings.acceptTerms) return null;
-    if (f.kind === 'checkbox') return /^(i have read|i acknowledge|i understand|acknowledged|understood|i consent|i agree|i accept|(you|i) declare that (you|i) (have )?read)\b/i.test(choiceLabel(f.el).trim()) && !/marketing|newsletter|promotional|talent (community|network|pool)|job alert|text message|\bsms\b|whatsapp|future (job )?(opportunit|openings)/i.test(f.question) ? { value: 'CHECK' } : null;
+    if (f.kind === 'checkbox') return /^(i have read|i acknowledge|i understand|acknowledged|understood|i consent|i agree|i accept|(you|i) declare that (you|i) (have )?read|i hereby (grant|give|authori[sz]e|consent|certify|acknowledge|agree)|allow us to (process|store|use|hold) (your|my) (personal )?(information|data))\b/i.test(choiceLabel(f.el).trim().replace(/^\(required\)\s*/i, '')) && !/marketing|newsletter|promotional|talent (community|network|pool)|job alert|text message|\bsms\b|whatsapp|future (job )?(opportunit|openings)/i.test(f.question) ? { value: 'CHECK' } : null;
     if (f.kind === 'checkgroup' && f.els.length === 1) { const t = choiceLabel(f.els[0]); return /^(i have read|i acknowledge|i understand|acknowledged|understood)\b/i.test(t.trim()) ? { value: t } : null; }
     if (f.kind !== 'radio' || f.els.length !== 1) return null;
     const t = choiceLabel(f.els[0]);
@@ -2125,6 +2191,7 @@
         if (ans.key === 'address1Combo') return fillAddressCombo(f.el, v);
         if (ans.key === 'AI' && typeof v === 'string' && /address|postal|zip/i.test(`${f.el.id || ''} ${f.el.name || ''}`)) ans = { ...ans, key: 'empStreet' };
         if (ans.key === 'empStreet' && typeof v === 'string') { typeInto(f.el, v); await sleep(400); f.el.blur(); await sleep(200); return norm(f.el.value) === norm(v); }
+        if (f.el.id && document.getElementById(f.el.id + '-select-wrapper') && !Array.isArray(v)) { if (await fillPctySelect(f.el, cands, ans)) return true; }
         if (f.ol) return fillOlList(f.el, Array.isArray(v) ? v : cands, ans);
         if (!Array.isArray(v)) return fillCombo(f.el, cands, ans);
         let any = false; // 多选（技能、语言）：一个个加；单选下拉只填第一个
@@ -2180,7 +2247,8 @@
   }
   function fileCtxOwn(input) {
     const h = shadowHost(input); // SmartRecruiters：spl-dropzone 组件的 label / data-test，和它外面那一段的文字（「Resume」小节）
-    return [input.id, input.name, input.getAttribute('aria-label'), ...[...(input.labels || [])].map(textOf), textOf(fileZone(input)), ...(h ? [h.getAttribute('label'), h.getAttribute('data-test'), textOf(h.parentElement).slice(0, 200)] : [])].join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const lb = String(input.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => textOf(document.getElementById(id)));
+    return [input.id, input.name, input.getAttribute('aria-label'), ...lb, ...[...(input.labels || [])].map(textOf), textOf(fileZone(input)), ...(h ? [h.getAttribute('label'), h.getAttribute('data-test'), textOf(h.parentElement).slice(0, 200)] : [])].join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   }
   function fileCtx(input) {
     const zone = fileZone(input);
@@ -2202,6 +2270,8 @@
     const raw = [...qa('input[type="file"]'), ...(isSR() ? shadowQa('input[type="file"]') : [])].filter((i) => !i.disabled && !i.closest('#wdaf-host'));
     const real = raw.filter((i) => !inAutofillZone(i));
     const all = real.length ? real : raw;
+    const byName = all.filter((i) => /(^|[^a-z])(cv|resume)([^a-z]|$)/i.test(i.name || i.id || '') && !/cover|letter|transcript/i.test(i.name || i.id || ''));
+    if (byName.length) return byName;
     const scored = all.map((i) => ({ i, t: ctx(i) }));
     const resume = scored.filter((s) => /resume|\bcv\b|curriculum/.test(s.t) && !/cover|transcript|letter|portfolio|writing sample/.test(s.t));
     if (resume.length) return resume.map((s) => s.i);
@@ -2216,7 +2286,7 @@
     if (!T || !T.data) return false;
     let n = 0;
     const inputs = qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host'))
-      .filter((i) => { const t = fileCtxOwn(i); return /transcript/.test(t) && !/resume|\bcv\b|cover letter|enrol|proof of|acceptance letter/.test(t) && !(/\bgraduate\b/.test(t) && !/undergrad/.test(t)); })
+      .filter((i) => { const own = norm([i.getAttribute('aria-label'), ...String(i.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => textOf(document.getElementById(id))), ...[...(i.labels || [])].map(textOf)].join(' ')); if (/transcript/.test(own) && !/resume|\bcv\b|cover letter|enrol|proof of|acceptance letter/.test(own) && !(/\bgraduate\b/.test(own) && !/undergrad/.test(own))) return true; const t = /transcript/.test(fileCtxOwn(i)) ? fileCtxOwn(i) : fileCtx(i); return /transcript/.test(t) && !/resume|\bcv\b|cover letter|enrol|proof of|acceptance letter/.test(t) && !(/\bgraduate\b/.test(t) && !/undergrad/.test(t)); })
       .filter((i, _, all) => !(all.length > 1 && /additional|another|second|other transcript/.test(fileCtxOwn(i))));
     for (const input of inputs) {
       if ((input.files && input.files.length) || uploadedInputs.has(input)) continue;
@@ -2834,6 +2904,20 @@
     if (enter) steps.push({ type: 'wait', ms: 600 }, { type: 'key', key: 'Enter' });
     return !!(await trusted(steps)).ok;
   }
+  if (!IN_FRAME) {
+    window.addEventListener('message', (e) => {
+      if (e.source !== window || !e.data) return;
+      if (e.data.__wdafDebug === 'fields') {
+        const out = collectFields().map((f) => [f.kind, (f.el.name || f.el.id || '').slice(-28), cleanLabel(f.question || '').slice(0, 50), isRequired(f) ? '*' : '', isEmpty(f) ? '空' : '', String(f.el.value == null ? '' : f.el.value).slice(0, 18)].join('|'));
+        window.postMessage({ __wdafDebugReply: { build: BUILD, out } }, '*');
+        return;
+      }
+      if (e.data.__wdafDebug !== 'files') return;
+      const out =qa('input[type="file"]').map((i) => ({ own: fileCtxOwn(i).slice(0, 160), ctx: fileCtx(i).slice(0, 200), files: i.files ? i.files.length : 0, up: uploadedInputs.has(i) }));
+      const ri = resumeInputs().map((i) => (i.name || i.id || '?').slice(-30) + (uploadedInputs.has(i) ? ' 传过' : '') + (inAutofillZone(i) ? ' autofill区' : ''));
+      window.postMessage({ __wdafDebugReply: { build: BUILD, out, ri, resumes: S.resumes.length, transcript: !!(S.transcript && S.transcript.data), tname: S.transcript && S.transcript.name } }, '*');
+    });
+  }
   if (isSR() && !IN_FRAME) {
     window.addEventListener('message', async (e) => {
       if (e.source !== window || !e.data || e.data.__wdafSrTest == null) return;
@@ -3325,8 +3409,9 @@
     const mode = S.settings.aiCoverLetter || 'always';
     if (mode === 'off' || S.settings.useAI === false) return [];
     return qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host')).filter((i) => {
-      const t = fileCtxOwn(i);
-      const own = norm([i.id, i.name, i.getAttribute('aria-label'), ...[...(i.labels || [])].map(textOf)].join(' '));
+      const t0 = fileCtxOwn(i);
+      const t = CL_RE.test(t0) ? t0 : norm(cleanLabel(precedingText(fileZone(i))) + ' ' + t0);
+      const own = norm([i.id, i.name, i.getAttribute('aria-label'), ...String(i.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => textOf(document.getElementById(id))), ...[...(i.labels || [])].map(textOf)].join(' '));
       const byLabel = CL_RE.test(own) && !/resume|\bcv\b|transcript/.test(own.replace(CL_RE, ' '));
       if (!byLabel && (!CL_RE.test(t) || /resume|\bcv\b|transcript/.test(t.replace(CL_RE, ' ')))) return false;
       if ((i.files && i.files.length) || uploadedInputs.has(i)) return false;
@@ -3849,6 +3934,7 @@
     await sleep(300);
   }
   function srAcPicked(f) {
+    if (f.srMulti) return srDeep(f.srAc.shadowRoot, '[role="option"][aria-selected="true"]').length > 0;
     const v = norm(f.el.value || '');
     return !!v && srDeep(f.srAc.shadowRoot, '[role="option"]').some((o) => norm(textOf(o) || textOf(shadowHost(o)) || (shadowHost(o) || {}).textContent || '') === v);
   }
@@ -3883,32 +3969,182 @@
     if (!hit) { dbg('SmartRecruiters 下拉没对上', f.question, cands, opts.map((o) => o.text).slice(0, 10)); if (f.el.value) await srClearAc(f); f.el.blur(); return false; }
     srFire(hit.el);
     await sleep(500);
+    if (f.srMulti) { // 多选：选上一个就够，下拉可能不自己收起，失焦关掉
+      const ok = hit.el.getAttribute('aria-selected') === 'true' || srAcPicked(f);
+      f.el.blur();
+      if (!ok) dbg('SmartRecruiters 多选点了没选上', f.question, hit.text);
+      return ok;
+    }
     const ok = norm(f.el.value) === norm(hit.text) || /\bng-valid\b/.test(f.srAc.className);
     if (!ok) dbg('SmartRecruiters 下拉点了没选上', f.question, hit.text, f.el.value);
     return ok;
+  }
+
+  async function paylocityTrimEducation() {
+    if (!/(^|\.)paylocity\.com$/i.test(location.hostname)) return 0;
+    const school = norm(S.profile.school || '');
+    if (!school) return 0;
+    let n = 0;
+    for (let guard = 0; guard < 6; guard++) {
+      const names = qa('input[id^="educationHistory.name."]').filter(isVisible);
+      if (names.length <= 1) break;
+      const other = names.find((i) => norm(i.value) && !norm(i.value).includes(school) && !school.includes(norm(i.value)));
+      if (!other) break;
+      let b = other;
+      for (let k = 0; k < 10 && b && !qa('button', b).some((x) => /delete this education/i.test(textOf(x))); k++) b = b.parentElement;
+      const del = b && qa('button', b).find((x) => /delete this education/i.test(textOf(x)));
+      if (!del) break;
+      dbg('Paylocity 删教育', other.value);
+      mouseClick(del);
+      await sleep(800);
+      const dlg = qa('[role="dialog"], [role="alertdialog"], .modal').find(isVisible); // 只在弹出确认框时点「Yes / Delete」，别点到页面上别的按钮
+      const yes = dlg && qa('button', dlg).find((x) => isVisible(x) && /^(yes|delete|confirm|ok)$/i.test(textOf(x)));
+      if (yes) { mouseClick(yes); await sleep(600); }
+      n++;
+    }
+    return n;
+  }
+
+  async function fillPctySelect(input, cands, ans) {
+    const box = () => document.getElementById(input.id + '-dropdown-list-container');
+    for (let t = 0; t < 2 && !box(); t++) { input.scrollIntoView({ block: 'center' }); input.blur(); await sleep(150); input.focus(); pressKey(input, 'ArrowDown'); await waitFor(box, 1500, 150); }
+    const b = box();
+    if (!b) return false;
+    const rows = () => qa('[role="listitem"]', b).map((el) => ({ el, text: textOf(el) })).filter((o) => o.text && !/^no results/i.test(o.text));
+    const scroller = q('[class*="menu-list"]', b) || b;
+    let hit = null;
+    for (let k = 0; k < 60 && !hit; k++) {
+      hit = pickAny(rows(), cands, 0);
+      if (hit) break;
+      const prev = scroller.scrollTop;
+      scroller.scrollTop = prev + Math.max(200, scroller.clientHeight - 40);
+      await sleep(120);
+      if (scroller.scrollTop === prev) break;
+    }
+    if (!hit) { scroller.scrollTop = 0; await sleep(150); hit = chooseOption(rows(), cands, ans); }
+    if (!hit) { dbg('Paylocity 下拉没对上', input.id, cands); input.blur(); return false; }
+    hit.el.scrollIntoView?.({ block: 'nearest' });
+    mouseClick(hit.el);
+    await sleep(500);
+    const shown = textOf(document.getElementById(input.id + '-select-wrapper')) || input.value;
+    const ok = norm(shown).includes(norm(hit.text)) || norm(input.value) === norm(hit.text);
+    dbg('Paylocity 下拉', input.id, '→', hit.text, ok ? '选上了' : '没选上');
+    return ok;
+  }
+  async function srPhoneUS() {
+    if (!isSR()) return;
+    const P = S.profile;
+    if (!/^(\+?1)?\D*\d{3}\D*\d{3}\D*\d{4}$/.test(String(P.phone || '').trim())) return;
+    for (const pf of shadowQa('spl-phone-field')) {
+      const sel = pf.shadowRoot && srDeep(pf.shadowRoot, 'spl-select')[0];
+      if (!sel || sel.getAttribute('value') === 'US') continue;
+      const us = srDeep(pf.shadowRoot, 'spl-select-option').find((o) => o.getAttribute('value') === 'US');
+      const inner = () => { const di = us && us.shadowRoot && srDeep(us.shadowRoot, 'spl-dropdown-item')[0]; return (di && di.shadowRoot && di.shadowRoot.querySelector('[role="option"]')) || di; };
+      const btn = sel.shadowRoot && sel.shadowRoot.querySelector('button');
+      for (let t = 0; t < 2 && sel.getAttribute('value') !== 'US'; t++) {
+        if (btn) { srFire(btn); await sleep(500); }
+        const o = inner(); if (o) { srFire(o); await sleep(600); }
+      }
+      dbg('SmartRecruiters 电话区号', sel.getAttribute('value'));
+    }
+  }
+
+  function srClickBtn(ob) { const sb = (ob && (ob.querySelector('spl-button') || ob)); const inner = (sb && sb.shadowRoot && sb.shadowRoot.querySelector('button')) || sb; if (inner) { inner.scrollIntoView?.({ block: 'center' }); srFire(inner); } }
+  async function srAddEntry(sec, kind, it) {
+    if (!q(`oc-${kind}-edit-form`, sec)) { srClickBtn(q(`oc-button[data-test="add-${kind}"]`, sec)); await waitFor(() => q(`oc-${kind}-edit-form`, sec), 3000, 200); }
+    const form = q(`oc-${kind}-edit-form`, sec);
+    if (!form) return false;
+    await sleep(800); // 表单刚展开时联想框还没就绪，马上打字会被吞掉（EY 第一段没存上）
+    const comp = (label) => [...form.querySelectorAll('spl-autocomplete, spl-input, spl-textarea')].find((c) => norm(c.getAttribute('label') || '') === norm(label));
+    const setVal = async (label, v, mustPick) => {
+      const c = v && comp(label);
+      const inp = c && c.shadowRoot && srDeep(c.shadowRoot, 'input, textarea').find((i) => isVisible(i));
+      if (!inp) return;
+      if (c.tagName !== 'SPL-AUTOCOMPLETE') { setText(inp, v); inp.blur(); await sleep(150); return; }
+      const f = { el: inp, srAc: c, question: label };
+      for (let tries = 0; tries < 2; tries++) {
+        await srClearAc(f);
+        setText(inp, v);
+        inp.dispatchEvent(new KeyboardEvent('keyup', { key: v.slice(-1), bubbles: true, composed: true }));
+        const pick = () => { const o = srAcOpts(c); return o.find((x) => norm(x.text) === norm(v)) || o.find((x) => norm(x.text).startsWith(norm(v))) || null; };
+        const hit = await waitFor(pick, 5000, 250);
+        if (hit) { srFire(hit.el); await sleep(500); if (norm(inp.value)) break; }
+        else if (mustPick) { await srClearAc(f); inp.blur(); break; }
+        await sleep(600);
+      }
+      await sleep(150);
+    };
+    const setDate = async (which, v) => {
+      const df = v && q(`oc-datepicker[data-test="${kind}-date-${which}"] spl-date-field`, form);
+      const inp = df && df.shadowRoot && srDeep(df.shadowRoot, 'input').find((i) => i.type === 'text');
+      if (!inp) return;
+      inp.focus(); inp.select?.(); setText(inp, v);
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true, composed: true }));
+      inp.blur(); inp.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      await sleep(300);
+    };
+    if (kind === 'education') {
+      await setVal('Institution', it.institution);
+      await setVal('Major', it.major);
+      await setVal('Degree', it.degree);
+      await setVal('School location', it.city, true);
+    } else {
+      await setVal('Title', it.title);
+      await setVal('Company', it.company);
+      await setVal('Office location', it.city, true);
+      await setVal('Description', it.description);
+    }
+    await setDate('from', it.from);
+    await setDate('to', it.to);
+    const need = kind === 'education' ? ['Institution'] : ['Title', 'Company'];
+    const empty = need.filter((l) => { const c = comp(l); const i = c && c.shadowRoot && srDeep(c.shadowRoot, 'input').find((x) => isVisible(x)); return i && !norm(i.value); });
+    if (empty.length) dbg('SmartRecruiters', kind, '保存前还空着', empty);
+    srClickBtn(q(`oc-button[data-test="${kind}-save"]`, sec));
+    const ok = await waitFor(() => !q(`oc-${kind}-edit-form`, sec), 4000, 200);
+    dbg('SmartRecruiters 加', kind, it.institution || it.company, ok ? '保存了' : '没保存上');
+    if (!ok) {
+      const f2 = q(`oc-${kind}-edit-form`, sec);
+      const errs = f2 ? [...new Set(srDeep(f2, '[class*="error" i], [role="alert"]').map((e) => textOf(e)).filter(Boolean))].slice(0, 6) : [];
+      const vals = f2 ? [...f2.querySelectorAll('spl-autocomplete, spl-input, spl-textarea, spl-date-field')].map((c) => (c.getAttribute('label') || '') + '=' + String(((c.shadowRoot && srDeep(c.shadowRoot, 'input, textarea').find((x) => x.type !== 'number')) || {}).value || '').slice(0, 25)) : [];
+      dbg('SmartRecruiters', kind, '没存上的原因', JSON.stringify(errs), JSON.stringify(vals));
+      srClickBtn(q(`oc-button[data-test="${kind}-cancel"]`, sec)); await sleep(600);
+    }
+    return !!ok;
+  }
+  async function srAddEntries() {
+    if (!isSR()) return 0;
+    const P = S.profile;
+    const mmyy = (m, y) => (m && y ? `${String(m).padStart(2, '0')}/${y}` : '');
+    const plans = [
+      ['experience', () => workJobs().map((j) => ({ title: j.title, company: j.company, city: j.city || String(j.location || '').split(',')[0], description: String(j.summary || '').replace(/\s*;\s*/g, ', '), from: j.start, to: j.current ? '' : j.end }))],
+      ['education', () => [{ institution: P.school, major: P.fieldOfStudy, degree: P.degreeFull || P.degree, city: String(P.schoolLocation || '').split(',')[0], from: mmyy(P.eduStartMonth, P.eduStartYear), to: mmyy(P.eduEndMonth, P.eduEndYear) }]],
+    ];
+    let n = 0;
+    for (const [kind, items] of plans) {
+      const sec = q(`oc-${kind}`);
+      if (!sec || !isVisible(sec)) continue;
+      const head = textOf(sec).slice(0, 200);
+      const required = /at least one/i.test(head) || new RegExp('^' + kind + '\\s*\\*', 'i').test(head);
+      const saved = qa(`oc-${kind}-entry`, sec).filter((e) => !q(`oc-${kind}-edit-form`, e)).length;
+      if (!required || saved) continue;
+      for (const it of items()) { if (!running) break; if (await srAddEntry(sec, kind, it)) n++; }
+    }
+    return n;
   }
 
   async function srCity() {
     if (!isSR()) return;
     const host = q('spl-autocomplete[data-test="location-autocomplete"], spl-autocomplete[label="City"]');
     if (!host || /\bng-valid\b/.test(host.className)) return;
-    const deep = (root, sel) => { const out = [...root.querySelectorAll(sel)]; for (const el of root.querySelectorAll('*')) if (el.shadowRoot) out.push(...deep(el.shadowRoot, sel)); return out; };
-    const inp = host.shadowRoot && deep(host.shadowRoot, 'input').find((i) => isVisible(i));
-    if (!inp) return;
+    const inp = host.shadowRoot && srDeep(host.shadowRoot, 'input').find((i) => isVisible(i));
     const P = S.profile;
-    const city = P.city;
-    if (!city) return;
-    for (const text of [city, `${city}, ${P.stateCode || US_STATES[norm(P.state || '')] || P.state || ''}`]) {
-      inp.focus();
-      setText(inp, text);
-      inp.focus();
-      inp.dispatchEvent(new KeyboardEvent('keyup', { key: 'y', bubbles: true, composed: true }));
-      const optText = (o) => textOf(o) || textOf(shadowHost(o));
-      const opt = await waitFor(() => [...deep(host.shadowRoot, '[role="option"], li'), ...deep(document, '.cdk-overlay-container [role="option"]')]
-        .find((o) => isVisible(o) && norm(optText(o)).includes(norm(city))), 12000, 400);
-      if (opt) { const target = textOf(opt) ? opt : (shadowHost(opt) || opt); mouseClick(target); target.click?.(); await sleep(600); if (/\bng-valid\b/.test(host.className)) { dbg('SmartRecruiters 城市选好了', optText(opt)); return; } }
-    }
+    if (!inp || !P.city) return;
+    const st = P.stateCode || US_STATES[norm(P.state || '')] || P.state || '';
+    const f = { kind: 'combo', el: inp, srAc: host, question: 'City' };
+    const ok = await fillSrSelect(f, [st ? `${P.city}, ${st}` : P.city, P.city], { key: 'city' });
+    dbg('SmartRecruiters 城市', ok ? '选好了' : '没选上', inp.value, host.className);
   }
+
 
   async function leverLocation() {
     const inp = q('input#location-input.location-input');
@@ -3944,6 +4180,8 @@
     if (isTalentSignupPage()) throw new Error('这个职位已关闭，页面是「Let\'s connect / 加入人才库」登记表，不是申请。插件不填（不加入人才库）。');
     await leverLocation();
     await srCity();
+    await srPhoneUS();
+    await srAddEntries();
     await waitForFields();
     const learned = await learnFromUser();
     if (learned) {
@@ -3954,6 +4192,7 @@
     if (await uploadResume()) filled++;
     if (await uploadTranscript()) filled++;
     if (!isWD()) filled += await addEmploymentBlocks();
+    filled += await paylocityTrimEducation();
     if (isWD() && /experience/i.test(currentStep())) filled += await fillExperienceSections();
 
     const attempts = new Map(); // 每个字段最多试 2 次，避免死循环
@@ -3963,7 +4202,7 @@
       const all = collectFields();
       for (const f of all) if (f.kind === 'text' && /\bmi\b|middle (name|initial)/i.test(f.question) && norm(f.el.value) === norm(valueFor('FULLNAME'))) setText(f.el, '');
       const fields = all
-        .map((f) => ({ ...f, ans: oracleItemAnswer(f) || phoneCountryAnswer(f) || languageAnswer(f, all) || otherFollowAnswer(f) || (f.block === 'employer' ? workAnswer(f) : null) || refAnswer(f) || dateAnswer(f) || naAnswer(f) || workAnswer(f) || textDateAnswer(f) || ackAnswer(f) || (f.datePart ? null : resolveField(f) || agreeAnswer(f)) }))
+        .map((f) => ({ ...f, ans: oracleItemAnswer(f) || pinpointEduAnswer(f) || pinpointWorkDate(f) || phoneCountryAnswer(f) || languageAnswer(f, all) || otherFollowAnswer(f) || (f.block === 'employer' ? workAnswer(f) : null) || refAnswer(f) || dateAnswer(f) || naAnswer(f) || workAnswer(f) || textDateAnswer(f) || ackAnswer(f) || (f.datePart ? null : resolveField(f) || agreeAnswer(f)) }))
         .filter((f) => !(f.ans && EDU_KEYS.has(f.ans.key) && foreignEduBlock(f.el)))
         .filter((f) => f.ans && f.ans.value && (isEmpty(f) || S.settings.overwrite || (f.ans.key === 'phone' && /\D/.test(f.el.value) && (isWD() || f.el.value.replace(/\D/g, '').slice(-10) !== String(f.ans.value).replace(/\D/g, '').slice(-10)))
           || (ADDRESS_KEYS.has(f.ans.key) && S.profile.address1) || (f.ans.empAddr && f.block === 'employer') || f.ans.key === 'phoneCountry' || (VISA_KEYS.has(f.ans.key) && CHOICE_KINDS.has(f.kind))) && !alreadyMatches(f, f.ans))
@@ -4083,7 +4322,7 @@
       const answers = rec ? rec.pages.flatMap((x) => x.answers) : [];
       const body = textOf(document.body);
       const lines = [];
-      const resumeOn = S.resumes.some((r) => r.name && body.includes(r.name)) || qa('input[type="file"]').some((i) => i.files && i.files.length && /resume|\bcv\b/.test(fileCtxOwn(i)));
+      const resumeOn = S.resumes.some((r) => r.name && body.toLowerCase().includes(r.name.toLowerCase())) || qa('input[type="file"]').some((i) => i.files && i.files.length && /resume|\bcv\b/.test(fileCtxOwn(i)));
       lines.push(resumeOn ? '简历 ✓' : '简历 ✗（页面上没看到简历文件名，请确认）');
       if (body.includes(clFileName())) lines.push('cover letter ✓');
       if (S.transcript && S.transcript.name && body.includes(S.transcript.name)) lines.push('成绩单 ✓');
@@ -4178,7 +4417,7 @@
     : location.href + '|' + document.title + '|' + collectFields().map((f) => f.question).join('|').slice(0, 800);
 
   const Q_DONE_RE = /application (has been |was )?(successfully )?(submitted|received|sent)|thank you for (applying|your application|submitting)|thanks for applying|successfully (applied|submitted)|we('ve| have) received your application|your application has been sent|application submitted|application success\b|we('re| are) thrilled that you('re| are) interested|感[谢謝](您)?(的申[请請]|申[请請]|花[时時][间間]申[请請]|投[递遞])|申[请請](已|已[经經])(提交|送出|收到)|已收到[你您]的申[请請]/i; // Greenhouse 按浏览器语言显示确认页（Garda 实测是中文「感謝您花時間申請」）
-  const US_PERSON_RE = /legally requires? .{0,30}u\.?s\.? person|requires? ["“]?u\.?s\.? person["”]? status|must be (a )?u\.?s\.? (citizen|person)\b|(only|exclusively) (open|available) to u\.?s\.? citizens|u\.?s\.? citizenship (is )?(required|mandatory)|requires? u\.?s\.? citizenship/i;
+  const US_PERSON_RE = /legally requires? .{0,30}u\.?s\.? person|requires? ["“]?u\.?s\.? person["”]? status|must be (a )?u\.?s\.? (citizen|person)\b|(only|exclusively) (open|available) to u\.?s\.? citizens|u\.?s\.? citizenship (is )?(required|mandatory)|requires? u\.?s\.? citizenship|(can |will )?only (hire|employ|consider|accept|sponsor) u\.?s\.? citizens|(open|available) only to u\.?s\.? citizens/i; // Thought Logic 题目「Due to company restrictions, we can only hire U.S. Citizens or those with a valid Green Card」
   const Q_CLOSED_RE = /(this|the) (job|position|posting|requisition|role|opening)( posting)? (is )?(no longer|not) (available|accepting|open|active)|(job|position|posting|requisition) (has been |is )?(closed|filled|expired|removed)|no longer accepting applications|(is )?not (currently )?accepting (new )?applications|page (you are looking for|you requested|you're looking for) (doesn'?t|does not|could not|cannot|can'?t) (exist|be found)|job not found|(this|the) job (is|has) (closed|expired)|sorry,? (this|the) (job|position|posting) /i;
   const Q_DUP_RE = /you('ve| have) already applied|already (applied|submitted an application) (for|to) this|you have previously applied (for|to) this|application already received/i; // Lever：…/already-received「Application already received」（BPM LLP）
   const Q_APPLY_RE = /^(apply|apply now|apply for (this|the) (job|position|role|opportunity)|apply to (this )?(job|position|role)|apply online|apply here|apply on (the )?company('s)? (site|website)|start (your |my )?application|i'?m interested|submit (an )?application)$/i;
@@ -4237,14 +4476,14 @@
   function qPreSubmitProblem() {
     const pick = pickerOnlyUploads();
     if (pick.length) return `有 ${pick.length} 个上传栏只能手动选文件（${pick.map((b) => cleanLabel(precedingText(b) || textOf(b)).slice(0, 25)).join('、')}），请你手动上传后再点 Submit`;
-    const nearFileName = (i) => { for (let e = i, k = 0; e && k < 5; e = e.parentElement, k++) if (/\.(pdf|docx?|txt|rtf)\b/i.test(textOf(e).slice(0, 600))) return true; return false; };
+    const nearFileName = (i) => /\.(pdf|docx?|txt|rtf)\b/i.test(textOf(fileZone(i)).slice(0, 600));
     const emptyReqFile = qa('input[type="file"]').filter((i) => !i.closest('#wdaf-host') && !i.disabled && !(i.files && i.files.length) && !inAutofillZone(i)
       && (i.required || i.getAttribute('aria-required') === 'true') && !nearFileName(i) && !uploadedInputs.has(i)
-      && !/resume|\bcv\b|curriculum|cover letter|covering letter/.test(fileCtx(i)));
+      && !/resume|\bcv\b|curriculum/.test(fileCtxOwn(i)));
     if (emptyReqFile.length) return `有 ${emptyReqFile.length} 个必填上传栏空着（${emptyReqFile.map((i) => cleanLabel(questionFor(i) || precedingText(fileZone(i)) || '上传').slice(0, 60)).join('；')}），要你准备好文件传上去`;
     const body = textOf(document.body);
-    const resumeShown = S.resumes.some((r) => r.name && body.includes(r.name));
-    const emptyResume = qa('input[type="file"]').filter((i) => /resume|\bcv\b/.test(fileCtxOwn(i)) && !(i.files && i.files.length));
+    const resumeShown = S.resumes.some((r) => r.name && body.toLowerCase().includes(r.name.toLowerCase()));
+    const emptyResume = qa('input[type="file"]').filter((i) => /resume|\bcv\b/.test(fileCtxOwn(i)) && !/cover|letter|transcript/i.test(i.name || i.id || '') && !(i.files && i.files.length));
     if (emptyResume.length && !resumeShown) return '简历栏是空的';
     const miss = collectFields().filter((f) => stillNeeded(f));
     if (miss.length) return `还有 ${miss.length} 个必填项空着`;
@@ -4253,10 +4492,20 @@
   const SPAM_FLAG_RE = /flagged as (possible |potential |likely )?spam|(suspected|possible) (spam|bot|automated)|unusual (activity|traffic)|automated (submission|traffic) (was )?detected/i;
   const spamFlagged = (before) => { const m = textOf(document.body).match(SPAM_FLAG_RE); return !!m && !String(before || '').includes(m[0]); };
   const Q_BLOCKED_MSG = '⏸ 网站没收插件点的提交（多半是网站的防机器人检查）。表都填好了，请你自己点一下 Submit。';
+  async function submitSlot() {
+    try {
+      const r = await chrome.runtime.sendMessage({ type: 'submitSlot', host: location.hostname });
+      if (r && r.wait > 0) { setStatus(`同一网站刚有一份在提交，等 ${Math.ceil(r.wait / 1000)} 秒再交（免得网站撞车报错）…`); await sleep(r.wait); }
+    } catch (_) { /* ignore */ }
+  }
   async function qSubmitGeneric() {
+    const cm = S.profile.needSponsorship === 'Yes' && textOf(document.body).match(US_PERSON_RE);
+    if (cm) { setStatus('⛔ 这个职位只收美国公民 / 绿卡，不投。'); qOut('ineligible', '只收美国公民 / 绿卡：' + cm[0]); return; }
     const bad = qPreSubmitProblem();
     if (bad) { setStatus(`没自动提交：${bad}。请检查。`); qOut('ready', '没自动提交：' + bad); return; }
+    if (isPinpoint()) { setStatus('✅ 都填好了。Pinpoint 不收插件点的提交（会报 500），请你检查一遍后自己点「Submit Application」。'); qOut('ready', 'Pinpoint 不收插件点的提交，等你自己点 Submit'); return; }
     if (captchaVisible()) { setStatus('🧩 提交前要过人机验证，请你点一下验证再点 Submit。'); qOut('captcha', '提交前要过人机验证'); return; }
+    await submitSlot();
     for (let attempt = 0; attempt < 2 && running; attempt++) {
       const btn = findSubmitButton();
       if (!btn) break;
@@ -4290,6 +4539,9 @@
   async function queueDrive() {
     const afterSubmit = (QUEUE.submitAt && Date.now() - QUEUE.submitAt < 15 * 60000) || (QUEUE.status === 'needs' && ['ready', 'verify', 'captcha'].includes(QUEUE.need));
     if (afterSubmit && (Q_DONE_RE.test(textOf(document.body).slice(0, 30000)) || Q_DONE_PATH.test(location.pathname))) { await addLog('已提交'); qOut('submitted', '提交成功页'); return; }
+    if (afterSubmit && (/^(500|502|503)\b|internal server error|bad gateway|service unavailable/i.test(document.title) || /something went wrong at our end/i.test(textOf(document.body).slice(0, 3000)))) {
+      await addLog('提交被拒'); setStatus('网站提交时报错（' + document.title.slice(0, 40) + '），没交上，稍后重投'); qOut('error', '提交后网站报错（' + document.title.slice(0, 40) + '），没交上'); return;
+    }
     for (let i = 0; i < 8; i++) {
       await sleep(i ? 3000 : 2500);
       if (!alive()) return;
@@ -4297,7 +4549,7 @@
       if (maybeApplication()) { onDetected(); return; }
       const body = textOf(document.body).slice(0, 6000);
       if (Q_DUP_RE.test(body) || /\/already-received\/?$/.test(location.pathname)) { qOut('dup', '页面说已经投过'); return; }
-      if (Q_CLOSED_RE.test(body) || /[?&]error=true/.test(location.search)) { qOut('closed', '职位已关闭：' + ((body.match(Q_CLOSED_RE) || [])[0] || location.search)); return; }
+      if (Q_CLOSED_RE.test(body) || /[?&]error=true/.test(location.search) || /\/jobs\/jobnotfound\b/i.test(location.pathname)) { qOut('closed', '职位已关闭：' + ((body.match(Q_CLOSED_RE) || [])[0] || location.search)); return; }
       if (/application submission is (currently )?unavailable|please try again later/i.test(body) && /ashbyhq\.com$/.test(location.hostname)) { setStatus('⏸ Ashby 暂时不收申请（多半是网站的防机器人限制）。过一阵请你自己打开试。'); qOut('ready', 'Ashby 暂时不收申请（多半是防机器人限制），过一阵你自己试'); return; }
       if (S.profile.needSponsorship === 'Yes' && US_PERSON_RE.test(body)) { setStatus('⛔ 这个职位只收美国公民 / 绿卡 / U.S. Person，不投。'); qOut('ineligible', '只收美国公民 / U.S. Person：' + body.match(US_PERSON_RE)[0]); return; }
       const a = qa('a, button, [role="button"], input[type="submit"], input[type="button"]')
@@ -4591,7 +4843,7 @@
           background: #fff; color: #1d2330; border: 1px solid #d5dae3; border-radius: 12px;
           box-shadow: 0 8px 28px rgba(0,0,0,.18); overflow: hidden; }
         .hd { display:flex; align-items:center; justify-content:space-between; padding: 8px 12px;
-          background: #0b6bcb; color: #fff; font-weight: 600; cursor: pointer; user-select: none; }
+          background: #0b6bcb; color: #fff; font-weight: 600; cursor: move; user-select: none; }
         .bd { padding: 10px 12px 12px; }
         .btns { display:grid; grid-template-columns: 1fr 1fr; gap: 6px; }
         button { font: inherit; padding: 7px 8px; border-radius: 7px; border: 1px solid #0b6bcb;
@@ -4629,6 +4881,8 @@
             <button class="stop">停止</button>
             <button class="ghost opts">设置</button>
             <button class="ghost allgo" title="让所有打开着的申请页一起开始「自动到提交前」">所有申请页一起开始</button>
+            <button class="ghost jobskip" title="这个职位不投了：队列里标成跳过，关掉这一页，接着投下一个">跳过这个</button>
+            <button class="ghost jobdone" title="这个职位你已经自己交上了：记成已提交，关掉这一页，接着投下一个">已投递</button>
           </div>
           <div class="st"></div>
           <ul class="miss"></ul>
@@ -4643,6 +4897,18 @@
     $('.stop').onclick = () => (proxyChild ? send('stop') : stopRun());
     $('.opts').onclick = () => chrome.runtime.sendMessage({ type: 'openOptions' });
     $('.allgo').onclick = () => chrome.runtime.sendMessage({ type: 'startAllTabs' }, (r) => { void chrome.runtime.lastError; setStatus(`已让 ${(r && r.sent) || 0} 个标签页开始（不是申请页的会自己忽略）`); });
+    $('.jobskip').onclick = () => {
+      if (running) stopRun();
+      if (QUEUE) qOut('skipped', '你在面板上点了「跳过这个」');
+      chrome.runtime.sendMessage({ type: 'panelMark', kind: 'skip', urls: [location.href] }, () => void chrome.runtime.lastError);
+      setStatus('⏭ 已跳过这个职位' + (QUEUE ? '，这一页马上关掉，队列接着投下一个' : '（队列里同一职位也标成跳过）'));
+    };
+    $('.jobdone').onclick = async () => {
+      if (running) stopRun();
+      await addLog('已提交（你标记）');
+      if (QUEUE) qOut('submitted', '你在面板上点了「已投递」');
+      setStatus('✅ 已记成已提交' + (QUEUE ? '，这一页马上关掉，队列接着投下一个' : '（队列里同一职位也算已提交）'));
+    };
     $('.clview').onclick = () => { if (shownCL) chrome.runtime.sendMessage({ type: 'viewResume', id: shownCL }); };
     $('.wsview').onclick = () => { if (shownWS) chrome.runtime.sendMessage({ type: 'viewResume', id: shownWS }); };
     $('.view').onclick = () => {
@@ -4654,7 +4920,35 @@
       });
     };
     $('.rsel').onchange = (e) => (proxyChild ? send('resume', e.target.value) : setResumeOverride(e.target.value));
+    let dragged = false;
+    const place = (x, y) => {
+      const w = host.offsetWidth || 280, h = host.offsetHeight || 60;
+      const left = Math.max(0, Math.min(innerWidth - Math.min(w, 120), x));
+      const top = Math.max(0, Math.min(innerHeight - 40, y));
+      host.style.left = left + 'px'; host.style.top = top + 'px'; host.style.right = 'auto'; host.style.bottom = 'auto';
+      return { left, top };
+    };
+    try { chrome.storage.local.get('panelPos', ({ panelPos }) => { void chrome.runtime.lastError; if (panelPos && panelPos.left != null) place(panelPos.left, panelPos.top); }); } catch (_) { /* 插件刚更新、上下文失效 */ }
+    $('.hd').addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      const r = host.getBoundingClientRect();
+      const dx = e.clientX - r.left, dy = e.clientY - r.top, sx = e.clientX, sy = e.clientY;
+      dragged = false;
+      const move = (ev) => {
+        if (!dragged && Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) < 5) return;
+        dragged = true;
+        place(ev.clientX - dx, ev.clientY - dy);
+      };
+      const up = () => {
+        removeEventListener('pointermove', move, true);
+        removeEventListener('pointerup', up, true);
+        if (dragged) { const r2 = host.getBoundingClientRect(); try { chrome.storage.local.set({ panelPos: { left: Math.round(r2.left), top: Math.round(r2.top) } }); } catch (_) { /* ignore */ } }
+      };
+      addEventListener('pointermove', move, true);
+      addEventListener('pointerup', up, true);
+    });
     $('.hd').onclick = () => {
+      if (dragged) { dragged = false; return; } // 刚拖完松手不算点击
       $('.box').classList.toggle('min');
       $('.tg').textContent = $('.box').classList.contains('min') ? '+' : '–';
     };

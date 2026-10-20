@@ -18,6 +18,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const liveDoc = sender && sender.tab && (!sender.documentLifecycle || sender.documentLifecycle === 'active');
   if (msg && msg.type === 'queueHello' && sender && sender.tab) { if (!liveDoc) { sendResponse({ item: null }); return; } qHello(sender.tab.id, [sender.tab.url, sender.url]).then(sendResponse); return true; }
   if (msg && msg.type === 'queueReport' && sender && sender.tab) { if (!liveDoc) { sendResponse({ ok: false }); return; } qReport(sender.tab.id, msg).then(sendResponse, (e) => sendResponse({ ok: false, error: String(e) })); return true; }
+  if (msg && msg.type === 'panelMark' && msg.kind === 'skip') {
+    const keys = new Set((msg.urls || []).filter((u) => /^https?:/.test(u || '')).map(qUrlKey));
+    qTx((Q) => { let n = 0; for (const it of Q.items) if (['pending', 'needs'].includes(it.status) && !it.tabId && (keys.has(qUrlKey(it.url)) || (it.lastUrl && keys.has(qUrlKey(it.lastUrl))))) { Object.assign(it, { status: 'skipped', need: '', note: '你在面板上点了「跳过这个」' }); n++; } return n; })
+      .then((n) => sendResponse({ ok: true, n }), () => sendResponse({ ok: false }));
+    return true;
+  }
+  if (msg && msg.type === 'submitSlot') {
+    const now = Date.now();
+    const slot = Math.max(now, (submitSlots.get(msg.host || '') || 0) + 25000);
+    submitSlots.set(msg.host || '', slot);
+    sendResponse({ wait: slot - now });
+    return;
+  }
   if (msg && msg.type === 'jobDone') {
     (async () => {
       const keys = new Set((msg.urls || []).filter((u) => /^https?:/.test(u || '')).map(qUrlKey));
@@ -99,6 +112,8 @@ async function buildHash() {
   }
   return String(h);
 }
+
+const submitSlots = new Map(); // 网站 → 最近一次（或排好的）提交时间
 
 async function devCheck() {
   if (!IS_DEV || Date.now() - lastDevCheck < 2000) return false;
@@ -457,7 +472,7 @@ async function qReport(tabId, m) {
     it.note = String(m.note || '').slice(0, 400);
     if (Array.isArray(m.missing)) it.missing = m.missing.slice(0, 8).map((s) => String(s).slice(0, 80));
     it.ended = now;
-    if (st === 'submitted' || st === 'dup' || st === 'closed' || st === 'ineligible') {
+    if (st === 'submitted' || st === 'dup' || st === 'closed' || st === 'ineligible' || st === 'skipped') { // skipped：你在面板上点了「跳过这个」
       it.status = st;
       it.need = '';
       const close = it.tabId;
@@ -763,7 +778,7 @@ async function qCmd(m, sender) {
   if (c === 'skip' || c === 'unskip') {
     const re = m.match ? new RegExp(m.match, 'i') : null;
     let n = 0;
-    await qTx((Q) => { for (const it of Q.items) if (((m.ids || []).includes(it.id) || (re && re.test(String(it.url || '') + ' ' + String(it.ats || '')) && it.status === (c === 'skip' ? 'pending' : 'skipped'))) && it.status !== 'running') { it.status = c === 'skip' ? 'skipped' : 'pending'; if (c === 'unskip') it.note = ''; n++; } });
+    await qTx((Q) => { for (const it of Q.items) if (((m.ids || []).includes(it.id) || (re && re.test(String(it.url || '') + ' ' + String(it.ats || '') + ' ' + String(it.company || '') + ' ' + String(it.lastUrl || '')) && it.status === (c === 'skip' ? 'pending' : 'skipped'))) && it.status !== 'running') { it.status = c === 'skip' ? 'skipped' : 'pending'; if (c === 'unskip') it.note = ''; n++; } });
     return { ...(await qSummary()), changed: n };
     
   }
