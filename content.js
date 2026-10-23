@@ -1,6 +1,7 @@
 (() => {
   if (window.__wdafLoaded) return;
   if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname) && /\/test-mock\//.test(location.pathname) && chrome.runtime && chrome.runtime.id !== 'mock') return;
+  if (window !== window.top && document.body && document.body.isContentEditable) return;
   window.__wdafLoaded = true;
   const DEAD_CTX_RE = /Extension context invalidated|Receiving end does not exist|message port closed/i;
   window.addEventListener('unhandledrejection', (e) => { if (DEAD_CTX_RE.test(String((e.reason && e.reason.message) || e.reason || ''))) e.preventDefault(); });
@@ -8,8 +9,11 @@
   document.querySelectorAll('#wdaf-host').forEach((h) => h.remove());
 
   const AUTO_KEY = 'wdaf-auto-running';
-  const BUILD = '2026-10-20.318'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
+  const USER_STOP_KEY = 'wdaf-user-stopped';
+  const userStopped = () => { try { return !!sessionStorage.getItem(USER_STOP_KEY); } catch (_) { return false; } };
+  const BUILD = '2026-10-22.448'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
   let QUEUE = null;
+  try { if (/\/(job|jobs|apply|application|careers?)\b/i.test(location.pathname) && !/\/jobTasks\/completed\//i.test(location.pathname)) sessionStorage.setItem('wdaf-lastJob', location.href.split('#')[0]); } catch (_) { /* ignore */ }
   let QUEUE_SUBMIT = false; // 队列设置：填完自动提交
   const sleep = (ms) => new Promise((r) => {
     if (QUEUE && document.hidden && ms >= 100) {
@@ -64,7 +68,7 @@
 
 
   async function loadState() {
-    const d = await chrome.storage.local.get(['profile', 'settings', 'resume', 'resumes', 'defaultResumeId', 'customRules', 'transcript']);
+    const d = await chrome.storage.local.get(['profile', 'settings', 'registration', 'mailbox', 'resume', 'resumes', 'defaultResumeId', 'customRules', 'transcript']);
     if (typeof d.customRules === 'string') {
       const cleaned = dropGenericLearned(d.customRules);
       if (cleaned !== d.customRules) { d.customRules = cleaned; await chrome.storage.local.set({ customRules: cleaned }); }
@@ -72,6 +76,8 @@
     S = {
       profile: wdafMergeProfile(d.profile),
       settings: { ...WDAF_DEFAULT_SETTINGS, ...(d.settings || {}) },
+      registration: d.registration || {},
+      mailbox: d.mailbox || {},
       resumes: wdafResumeList(d),
       defaultResumeId: d.defaultResumeId || '',
       transcript: d.transcript || null,
@@ -243,6 +249,120 @@
     el.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
   }
 
+  const TAG_BOX = '.react-tagsinput, .bootstrap-tagsinput';
+  const tagChips = (el) => { const b = el.closest?.(TAG_BOX); return b ? qa('.react-tagsinput-tag, .bootstrap-tagsinput .tag', b).filter((c) => !c.contains(el)) : []; };
+  const chipText = (c) => textOf(c).replace(/\s*[×✕]$|\s+x$/i, '').trim();
+  const splitTags = (v) => {
+    const out = [];
+    let depth = 0, cur = '';
+    for (const ch of String(v || '')) {
+      if (ch === '(') depth++; else if (ch === ')') depth = Math.max(0, depth - 1);
+      if (!depth && /[,;|]/.test(ch)) { out.push(cur); cur = ''; } else cur += ch;
+    }
+    out.push(cur);
+    return out.map((s) => s.trim()).filter(Boolean);
+  };
+  async function addTags(el, value) {
+    const have = new Set(tagChips(el).map((c) => norm(chipText(c))));
+    let n = 0;
+    for (const t of splitTags(value)) {
+      if (have.has(norm(t))) continue;
+      setText(el, t);
+      have.add(norm(t));
+      n++;
+      await sleep(150);
+    }
+    return n;
+  }
+  async function fillFocusDate(el, v) {
+    const m = String(v || '').match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (!m || !/mm\s*\/\s*dd/i.test(el.getAttribute('placeholder') || '')) return false;
+    el.scrollIntoView?.({ block: 'center' });
+    el.focus();
+    el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    await sleep(300);
+    const cur = (el.id && document.getElementById(el.id)) || el;
+    if (cur.type !== 'date') return false;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(cur, `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`);
+    cur.dispatchEvent(new Event('input', { bubbles: true }));
+    cur.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(200);
+    cur.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    cur.blur();
+    await sleep(300);
+    dbg('聚焦变日期框，按 YYYY-MM-DD 写入', cur.id, v);
+    return true;
+  }
+
+  const MARKETING_CB_RE = /keep me (informed|updated)|personali[sz]ed (emails?|communications?)|(job|employment|career) (alerts?|opportunit\w*|updates?)|marketing|newsletter|recruiting (updates|communications?)|talent (community|network|pool)|(receive|send me) (emails?|updates|communications?|news)/i;
+  async function checkRequiredMarketing() {
+    let n = 0;
+    for (const el of qa('input[type="checkbox"]', formScope())) {
+      if (el.checked || el.disabled || el.closest('#wdaf-host') || isSubscribeForm(el.closest('form'))) continue;
+      const lab = (el.labels && el.labels[0]) || el.closest('label');
+      const t = textOf(lab || el.parentElement);
+      if (!t || !MARKETING_CB_RE.test(t) || !(isVisible(el) || (lab && isVisible(lab)))) continue;
+      const req = el.required || el.getAttribute('aria-required') === 'true' || /^\s*\*/.test(t) || errorRequired.has(el) || !!fieldErrText(el).trim() || !!el.closest('[aria-invalid="true"], .form-error, .has-error');
+      if (!req) continue;
+      if (lab && !lab.contains(el)) mouseClick(lab); else el.click();
+      await sleep(200);
+      if (!el.checked) { el.click(); await sleep(150); }
+      dbg('必填的营销同意：已勾', t.slice(0, 80), el.checked);
+      if (el.checked) { logAI(`☑ 必填的推送同意 → 勾上（${t.replace(/^\s*\*/, '').slice(0, 40)}…）`); n++; }
+    }
+    return n;
+  }
+
+  function expandCollapsed() {
+    let n = 0;
+    for (const body of qa('.collapse:not(.show)', formScope())) {
+      if (body.closest('#wdaf-host, nav, header, footer') || !q('input:not([type="hidden"]), select, textarea, canvas', body)) continue;
+      body.classList.add('show');
+      n++;
+    }
+    if (n) dbg('展开折叠分节', n);
+    return n;
+  }
+  async function viewpointInitials() {
+    const cv = qa('canvas').find((c) => isVisible(c) && /initial (here|and save)|save your signature/i.test(textOf(c.closest('.card-body, form, section, div') || c.parentElement)));
+    if (!cv) return 0;
+    let box = cv.parentElement;
+    for (let k = 0; k < 5 && box && !qa('button', box).some((b) => /generate$/i.test(textOf(b))); k++) box = box.parentElement;
+    const gen = box && qa('button', box).find((b) => isVisible(b) && /generate$/i.test(textOf(b)));
+    if (!gen || box.dataset.wdafSigned === '1') return 0;
+    gen.click();
+    const ok = await waitFor(() => qa('.modal.show button, [role="dialog"] button, .e-dialog button').find((b) => isVisible(b) && /^confirm$/i.test(textOf(b))), 4000, 200);
+    if (!ok) { dbg('签名画板：没等到 Confirm'); return 0; }
+    ok.click();
+    await sleep(1000);
+    box.dataset.wdafSigned = '1';
+    logAI('✍️ 签名画板：Generate 首字母 → Confirm');
+    return 1;
+  }
+
+  async function tidyTags() {
+    let n = 0;
+    for (const b of qa(TAG_BOX).filter(isVisible)) {
+      const input = q('input', b);
+      if (!input) continue;
+      const parts = [];
+      for (let guard = 0; guard < 40; guard++) {
+        const seen = new Set();
+        const bad = tagChips(input).find((c) => { const t = norm(chipText(c)); if (seen.has(t)) return true; seen.add(t); return splitTags(chipText(c)).length >= 3; });
+        if (!bad) break;
+        const x = q('.react-tagsinput-remove, [data-role="remove"]', bad);
+        if (!x) break;
+        if (splitTags(chipText(bad)).length >= 3) parts.push(...splitTags(chipText(bad)));
+        dbg('标签框清理', chipText(bad));
+        mouseClick(x);
+        n++;
+        await sleep(200);
+      }
+      if (parts.length) await addTags(input, parts.join(', '));
+    }
+    return n;
+  }
+
   async function waitFor(fn, timeout = 5000, interval = 150) {
     const end = Date.now() + timeout;
     while (Date.now() < end) {
@@ -277,7 +397,7 @@
         if (sib.matches('script, style, template, noscript')) { k--; continue; } // 页面脚本的文字不是题目（JazzHR 读成了「window.resumeRequired = true」）
         if (sib.matches('input, select, textarea, button') || q('input, select, textarea', sib)) break;
         const t = String(labelText(sib) || '').replace(/SVGs? (are )?not supported by this browser\.?/gi, '').trim();
-        if (t && t.length <= 400 && !(skip && skip.test(cleanLabel(t)))) return { el: sib, text: t };
+        if (t && (t.length <= 400 || (t.length <= 800 && !depth && !k)) && !(skip && skip.test(cleanLabel(t)))) return { el: sib, text: t };
       }
       node = node.parentElement;
     }
@@ -289,7 +409,17 @@
   }
 
   const GENERIC_Q_RE = /^(please )?(select|choose|make a selection)?( one)?( of)?( the)? ?(options?|selection)?$|^please of the options?$|^(please )?(select|choose) (one|an option)$/i;
+  const SELECT_ONLY_Q_RE = /^(select one|select an option|please select( one)?|choose one|please choose|select)\s*:?\s*$/i;
   function questionFor(el) {
+    const qx = questionFor0(el);
+    if (!SELECT_ONLY_Q_RE.test(String(qx || '').trim())) return qx;
+    const fe = el.closest && el.closest('[data-automation-id^="formField"], .form-group, fieldset, li');
+    let prev = fe && fe.previousElementSibling;
+    while (prev && !textOf(prev).trim()) prev = prev.previousElementSibling;
+    const pt = prev ? cleanLabel(textOf(prev)).slice(0, 200) : '';
+    return pt ? `${pt} — ${qx}` : qx;
+  }
+  function questionFor0(el) {
     if (isSR() && shadowHost(el)) {
       const hl = hostAttr(el, 'label'); if (hl) return cleanLabel(hl);
       if ((el.type === 'checkbox' || el.type === 'radio') && textOf(shadowHost(el))) return cleanLabel(textOf(shadowHost(el)));
@@ -317,6 +447,10 @@
       if (hd && textOf(hd)) return cleanLabel(textOf(hd));
     }
     const isChoice = el.type === 'radio' || el.type === 'checkbox' || isAriaChoice(el);
+    for (let p = isChoice ? el.parentElement : el, k = 0; p && k < 4 && p !== document.body; p = p.parentElement, k++) {
+      const pl = p.id && document.getElementById(p.id + '-label');
+      if (pl && !pl.contains(el) && textOf(pl)) return cleanLabel(textOf(pl));
+    }
     const cands = [];
     if (!isChoice && el.labels && el.labels[0] && textOf(el.labels[0])) cands.push(textOf(el.labels[0]));
     const ownAria = el.getAttribute('aria-label') || '';
@@ -327,7 +461,8 @@
       let p = el.parentElement;
       for (let k = 0; k < 6 && p && p !== fs && p !== document.body; k++, p = p.parentElement) {
         if (qa('input, select, textarea', p).filter((c) => c.type !== 'hidden' && isVisible(c)).length > 1) break;
-        const l = [...p.children].find((c) => c.tagName === 'LABEL' && !c.htmlFor && textOf(c));
+        const l = [...p.children].find((c) => c.tagName === 'LABEL' && !c.htmlFor && textOf(c) && !/footnote|error|invalid/i.test(c.className || '')
+          && !/^(question |field |answer )?required\.?$/i.test(textOf(c)) && !REQ_ERR_RE.test(textOf(c)));
         if (l) { cands.push(textOf(l)); break; }
       }
     }
@@ -340,7 +475,7 @@
         if (l) { cands.push(textOf(l)); break; }
       }
     }
-    if (fs) cands.push(textOf(q('legend', fs)));
+    if (fs && !/^[a-z]+[A-Z][\w$]*(\.[\w$]+)*$|^[\w$]+\.[\w$.]+$/.test(textOf(q('legend', fs)))) cands.push(textOf(q('legend', fs)));
     const ff = el.closest('[data-automation-id^="formField"]');
     if (ff) {
       for (const l of qa('label, legend', ff)) {
@@ -402,12 +537,13 @@
     return (root.querySelector ? root : document).querySelector(`input[name="${CSS.escape(el.name)}"][value="${CSS.escape(el.value)}"]`)
       || document.querySelector(`input[name="${CSS.escape(el.name)}"][value="${CSS.escape(el.value)}"]`) || el;
   };
-  const isChecked = (el0) => { const el = liveChoice(el0); return el.tagName === 'INPUT' ? el.checked || choiceWrapOn(el) : ['aria-checked', 'aria-pressed', 'aria-selected'].some((a) => el.getAttribute(a) === 'true'); };
+  const isChecked = (el0) => { if (/^UI5-/.test(el0.tagName || '')) return el0.hasAttribute('checked'); const el = liveChoice(el0); return el.tagName === 'INPUT' ? el.checked || choiceWrapOn(el) : ['aria-checked', 'aria-pressed', 'aria-selected'].some((a) => el.getAttribute(a) === 'true'); };
 
   function choiceLabel(el) {
+    if (/^UI5-/.test(el.tagName || '')) return zwClean(el.getAttribute('text') || el.getAttribute('accessible-name') || textOf(el));
     if (el.tagName === 'SPL-RADIO') return el.getAttribute('label') || textOf(el);
     if (isSR() && shadowHost(el)) { const own = el.labels && el.labels[0] ? textOf(el.labels[0]) : ''; const ht = textOf(shadowHost(el)); if (ht && cleanLabel(own).replace(/[*\s]/g, '').length < 2) return ht; }
-    if (isAriaChoice(el)) return el.getAttribute('aria-label') || textOf(el);
+    if (isAriaChoice(el)) return el.getAttribute('aria-label') || textOf(el) || textOf(el.closest('li, [role="listitem"], [role="option"]') || el.parentElement);
     if (el.labels && el.labels[0]) return textOf(el.labels[0]);
     if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
     return textOf(el.parentElement);
@@ -422,19 +558,25 @@
     return best;
   }
 
+  const MODAL_SEL = 'ngb-modal-window, .modal.show, .modal.in, .modal.d-block, [role="dialog"][aria-modal="true"]';
   function formScope() {
-    return q('[data-automation-id="applyFlowPage"]') || document.body;
+    const wd = q('[data-automation-id="applyFlowPage"]');
+    if (wd) return wd;
+    const ms = qa(MODAL_SEL).filter((m) => !m.closest('#wdaf-host') && isVisible(m) && !m.parentElement.closest(MODAL_SEL) && q('input, select, textarea', m));
+    if (ms.length > 1) return ms[ms.length - 1];
+    if (ms.length === 1 && qa('input[type="text"], input[type="email"], input[type="tel"], input:not([type]), select, textarea', ms[0]).some(isVisible)) return ms[0];
+    return document.body;
   }
 
 
   const TEXT = ['text'];
   const TEXTISH = ['text', 'prompt', 'combo'];
-  const PICK = ['listbox', 'prompt', 'select', 'combo', 'popcombo'];
+  const PICK = ['listbox', 'prompt', 'select', 'combo', 'popcombo', 'ui5sel'];
   const SUBSCRIBE_RE = /job posting notifications|notify me of new|new (job )?(opportunities|positions|postings)|job alerts?|newsletter|talent (community|network|pool)|marketing (communications|emails?)|hear more about career|subscribe|recruiting updates/;
   const CRED_RE = /^(login|log-?in( id| name| email)?|user ?name|user ?id|create (a )?login|password|confirm password|re-?enter password)\b/i;
   const TOOL_KINDS = [...PICK, 'radio', 'checkgroup', 'text']; // 「用过哪些编程工具」：多选框组、下拉、文本框都可能
-  const SOURCE_RE = /how did you (hear|learn|find|come across)|where did you (hear|learn|find|see)|^source\b|referral source|recruiting source|candidate source/;
-  const SMS_OK_RE = /^(?!.*(marketing|promotional|newsletter|talent (community|network|pool)|job alerts?)).*(select ['"“]?yes['"”]? to opt-?in|opt-?in or ['"“]?no['"”]? to opt-?out|^text consent|consent to (receive )?(text|sms|automated call)|(receive|get) (communications?|messages?|notifications?|updates?|texts?|alerts?) (via|by|through|over) (sms|text|whatsapp)|\b(sms|whatsapp)\b.{0,60}(communications?|messages?|notifications?|updates?|alerts?|opt-?in|consent))/;
+  const SOURCE_RE = /how did you (first )?(hear|learn|find|come across)|where did you (first )?(hear|learn|find|see)|^source\b|referral source|recruiting source|candidate source/;
+  const SMS_OK_RE = /^(?!.*(marketing|promotional|newsletter|talent (community|network|pool)|job alerts?)).*(opt[- ]?in (for|to) (receive )?(texts?|sms|text messages?)\b|select ['"“]?yes['"”]? to opt-?in|opt-?in or ['"“]?no['"”]? to opt-?out|^text consent|consent to (receive )?(text|sms|automated call)|(receive|get) (communications?|messages?|notifications?|updates?|texts?|alerts?) (via|by|through|over) (sms|text|whatsapp)|\b(sms|whatsapp)\b.{0,60}(communications?|messages?|notifications?|updates?|alerts?|opt-?in|consent))/;
   const RULES = [
     { re: /^(phone )?extension$|phone extension|^ext\.?$/, key: null },
     { re: /interested in hearing about (new |other |future )?(opportunit|position|job)|weekly email|job alerts?|subscribe|newsletter|talent (community|network|pool)|notify me of new/, key: null },
@@ -447,8 +589,11 @@
     { re: /phone device type|phone type|device type/, key: 'phoneType', kinds: PICK },
     { re: /\bphone\b|mobile number|\bcell\b/, key: 'phone', kinds: TEXT, self: true },
     { re: /e-?mail/, key: 'email', kinds: TEXT, self: true },
-    { re: /preferred (first |given )?name|nickname|name (do )?you (prefer|go by)|(would like to be|prefer to be) called/, key: 'preferredName', kinds: TEXT },
+    { re: /preferred (first |given |last |family |sur)?name|nickname|name (do )?you (prefer|go by)|(would like to be|prefer to be) called/, key: 'preferredName', kinds: TEXT },
+    { re: /check (this|the) box to (confirm|acknowledge|accept|agree)\b/, key: 'TERMS', kinds: ['checkbox'] },
+    { re: /^(i do not|i don'?t) have a middle name|^no middle name/, key: 'noMiddleName', kinds: ['checkbox'] },
     { re: /i (have|use) a preferred name|use (a |my )?preferred name/, key: 'preferredNameBox', kinds: ['checkbox'] },
+    { re: /^(do you have a |would you like to (use|provide) a )?preferred (first )?name\??$/, key: 'preferredNameYN', kinds: [...PICK, 'radio'] },
     { re: /preferred (first |last |given |family )?name|nickname|local (given|family) name/, key: null },
     { re: /additional information that (could|would|might) be helpful|we don'?t need a cover letter|use the space below to tell us|anything else (you'?d like|we should know)/, key: null, kinds: TEXT },
     { re: /name.{0,40}(native language|native script|original script|local language|chinese characters|in chinese)|native[- ]language name|name in (your )?native/, key: 'nativeName', kinds: TEXT },
@@ -464,7 +609,7 @@
     { re: /^location( \(city\))?$|^current (city|location)|city of residence|where are you (currently )?(located|based)/, key: 'cityLoc', kinds: [...PICK, 'text'], self: true },
     { re: /^city|\btown\b/, key: 'city', kinds: [...TEXT, 'combo'], self: true },
     { re: /postal|\bzip\b/, key: 'postalCode', kinds: [...TEXT, 'combo'], self: true },
-    { re: /^(state|province|region|administrative area)/, key: 'state', kinds: [...PICK, 'text'], self: true }, // Paylocity 地址栏叫「Administrative Area」
+    { re: /^(state|province|region|administrative area|省|州)/, key: 'state', kinds: [...PICK, 'text'], self: true }, // Paylocity 地址栏叫「Administrative Area」
     { re: /^country/, key: 'country', kinds: [...PICK, 'text'], first: true, self: true },
     { re: /sponsorship needs|what (type|kind) of (visa |work )?(sponsorship|authori[sz]ation)|(current|your) (immigration|visa) (status|type|category)|describe your (visa|immigration|sponsorship)/, key: null, kinds: TEXT },
     { re: /(first )?hear(d)? (about|of) (this|the) (job|position|role|opening|opportunity) online|^did you .{0,40}\bonline\b/, key: 'YES', kinds: [...PICK, 'radio'] },
@@ -472,7 +617,9 @@
     { re: SOURCE_RE, key: 'source' },
     { re: /^(career communi\w*|job boards?)\b|which (job board|website|site)\b/, key: 'source', kinds: [...PICK, 'radio'] },
     { re: /stem\s*\/?\s*opt|24[- ]month (opt )?extension/, key: 'stemOpt', kinds: [...PICK, 'radio'] },
+    { re: /^(?!.*\b(future|now or|eventually|at any (point|time))\b).*((\bimmediately\b|within (the (next|first) )?(three|3) months|upon hire|at the time of hire).{0,80}sponsor|sponsor.{0,60}(\bimmediately\b|within (the (next|first) )?(three|3) months))/, key: 'sponsorSoon', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /(currently|presently|now) (being )?sponsored|sponsored by (another|a different|your current|a current|an?) (company|employer)|(current|existing) (employer )?sponsorship (from|by|with)/, key: 'currentlySponsored', kinds: [...PICK, 'radio'] },
+    { re: /^hours? (per|a|each) week$|^weekly hours$|^hours ?\/ ?week$|^hrs ?(per|\/) ?(week|wk)$/, key: 'hoursPerWeek', kinds: ['text'] },
     { re: /^(?!.*without).*\b(require|requires|need|needs)\b (\w+ ){0,3}(visa )?sponsor/, key: 'needSponsorship', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /(hold|have) .{0,40}practical training|currently (hold|have|on) (an? )?opt\b|\bopt\b (status|ead) (currently|now)/, key: 'hasOPT', kinds: [...PICK, 'radio'] },
     { re: /used (any )?(portion|part) of .{0,60}(optional practical training|\bopt\b)|(have|has) used (your |any )?(opt|optional practical training)\b/, key: 'hasOPT', kinds: [...PICK, 'radio'] },
@@ -503,7 +650,7 @@
     { re: /^degree status$|status of (your )?degree|degree (completion )?status/, key: 'degreeStatus', kinds: [...PICK, 'radio'] },
     { re: /degree (granted|conferred|awarded|completed)|have you (graduated|completed your degree)/, key: 'degreeGranted' },
     { re: /level of education you are (currently )?(completing|pursuing)|current level of education|(degree|education)( level)? (that )?(you are|you're) currently (pursuing|enrolled in|working (on|towards?)|completing|obtaining|seeking)/, key: 'degree', kinds: PICK },
-    { re: /graduation (date|year|month|term|semester)|(expected|anticipated) (date of )?graduation|when (do|will) you (expect to )?graduate|expect(ed|ing)? to graduate|graduat\w* (date|year)/, key: 'gradDate', kinds: [...PICK, 'text'] },
+    { re: /graduation (date|year|month|term|semester)|(expected|anticipated) (date of )?graduation|when (do|will) you (expect to )?graduate|expect(ed|ing)? to graduate|graduat\w* (date|year)/, key: 'gradDate', kinds: [...PICK, 'text', 'radio'] }, // MacLean-Fogg「What is your anticipated college graduation date?」是一串单选（Fall 2027）
     { re: /^(?!.*(highest|complet|attain|obtain)).*((degree|education)\b.{0,30}pursu|(education|degree|academic) level|level of (education|degree|study)|degree type|class standing|year in school|year of study|student (classification|standing|level))/, key: 'degree', kinds: [...PICK, 'radio', 'checkgroup'] }, // Aramco「What will your student classification be in Summer 2027?」；Paylocity 筛选题「Please select your currently enrolled degree type.」是多选框（Associates / Bachelors / Masters / PhD）
     { re: /(school|university|college|institution)\b.{0,60}\bundergrad(uate)? (studies|degree|education)|undergrad(uate)? (school|university|college|institution)/, key: 'undergradSchool', kinds: [...PICK, 'text'] },
     { re: /undergrad\w*.{0,30}(major|discipline|field|area of study|concentration)|(major|discipline|field of study|area of study).{0,30}undergrad|bachelor'?s?( degree)?.{0,20}(major|discipline|field of study)/, key: 'undergradMajor' },
@@ -561,11 +708,13 @@
     { re: /exclu\w* .{0,140}(health ?care program|medicare|medicaid)|(medicare|medicaid|federal health ?care).{0,80}(exclu|debar|suspen|sanction)|\boig\b.{0,40}exclu|exclusion list|\bdebarred\b|suspended,? (or )?excluded/, key: 'healthcareExclusion', kinds: [...PICK, 'radio'] },
     { re: /\b(sec|cftc|finra|msrb|nfa)\b|securities and exchange commission|commodity futures|self-regulatory organization|municipal securities rulemaking|advisory affiliate|broker-?dealer|investment-related|subject of any (investigation|proceeding)|surety (company|bond)|refused a bond|bond (was )?(denied|revoked|paid out)|enjoined|injunction/, key: 'regulatoryNo', kinds: [...PICK, 'radio'] },
     { re: /political (contribution|action committee)|\bpac\b|eligible to vote for the candidate|solicit(ed)? (any )?(contribution|payment)s? (for|to) (an? )?(official|candidate)/, key: 'politicalNo', kinds: [...PICK, 'radio'] },
+    { re: /^(?!.*driv).*((sanction|probation|suspen|revo[ck]|disciplin|limitation|restrict)\w*\b.{0,80}\b(licen[cs]e|registration|certification)s?\b|\b(licen[cs]e|registration|certification)s?\b.{0,60}(sanction|probation|suspen|revo[ck]|disciplin|restrict))/, key: 'NO', kinds: [...PICK, 'radio'] },
     { re: /convicted|pled guilty|plead(ed)? guilty|nolo contendere|no contest|criminal (record|offense|conviction|history)|felony|misdemeanor/, key: 'criminalRecord', kinds: [...PICK, 'radio'] },
     { re: /(presently|currently|ever( been)?) licensed in the (insurance|securities)|(hold|have) (any |an? )?(securities|insurance|finra) licen|finra licen|series \d+ licen/, key: 'securitiesLicense', kinds: [...PICK, 'radio'] },
     { re: /bonding company|bond (for you|denied|revoked)|been bonded|denied a bond/, key: 'bondDenied', kinds: [...PICK, 'radio'] },
     { re: /(unsatisfied|outstanding) (judg|lien)|judg(e)?ments? or liens|liens? against you/, key: 'judgments', kinds: [...PICK, 'radio'] },
     { re: /relatives?\b|family (or friends?|members?)|friends? or family|related to (an? |any |the )?(current |former |existing )?(employee|staff|associate|director|officer|partner|member|anyone|someone|person|individual)|close personal relationship/, key: 'relatives' },
+    { re: /^(min(imum)?|max(imum)?)\.?( desired)? (salary|pay|wage|compensation)\b/, key: 'salaryRange', kinds: TEXT },
     { re: /(salary|pay|compensation|wage)s? (or|\/) (hourly|pay rate|rate)|salary or hourly|annual or hourly/, key: 'salaryEither', kinds: TEXT },
     { re: /hourly (pay )?(rate|wage)|pay rate per hour|rate per hour|hourly (compensation|expectation)/, key: 'salaryHourlyOnly', kinds: TEXT },
     { re: /desired (total |annual |base )?(salary|pay|compensation)|salary (expectation|requirement)s?|expected (salary|compensation|pay)|compensation expectation|base compensation|(salary|pay|compensation) (are you )?(expect|looking for|requirement)|what are your (salary|pay|compensation)/, key: 'salary', kinds: TEXT },
@@ -606,7 +755,7 @@
     { re: /(confidential information|trade secrets?|proprietary information).{0,120}(employer|employment|position)/, key: 'confidentialInfo', kinds: [...PICK, 'radio'] },
     { re: /(require|need|request)\b.{0,30}(reasonable )?accommodation|reasonable accommodation.{0,80}(require|need|request)/, key: 'needAccommodation', kinds: [...PICK, 'radio'] },
     { re: /disabilit/, key: 'disability' },
-    { re: /^(?!.*(marketing|recruiting updates|job (alerts?|opportunit)|new (job )?opportunit|\bsms\b|text messag|newsletter|promotional|talent (community|network|pool)|receive (emails|updates|communications))).*(terms|consent|i agree|acknowledg|certify|attest|i have read|\bi accept\b|privacy (statement|policy|notice))/, key: 'TERMS', kinds: ['checkbox'] }, // 「I accept thePrivacy statement」（ACT Group，链接贴着前面的字）
+    { re: /^(?!.*(marketing|recruiting updates|job (alerts?|opportunit)|new (job )?opportunit|\bsms\b|text messag|newsletter|promotional|talent (community|network|pool)|receive (emails|updates|communications))).*(terms|consent|i agree|acknowledg|certify|certification|attest|i have read|\bi accept\b|privacy (statement|policy|notice)|checking this box is (equivalent|the same) (to|as) (a |your )?signature|(electronic|e-) ?signature)/, key: 'TERMS', kinds: ['checkbox'] }, // 「APPLICANT'S CERTIFICATION & AGREEMENT Signature (Checking this box is equivalent to signature)」（Martin Marietta 的 Jobvite：勾选即签名，和签名栏填全名一样） // 「I accept thePrivacy statement」（ACT Group，链接贴着前面的字）
     { re: /^name$|^your name|full name|signature$/, key: 'FULLNAME', kinds: TEXT, self: true },
   ];
 
@@ -626,6 +775,7 @@
     if (key === 'smsTerms') return P.smsConsent === 'Yes' && S.settings.acceptTerms ? 'CHECK' : '';
     if (key === 'visaStatus') return P.f1Status === 'Yes' ? 'F-1' : '';
     if (key === 'salaryHourlyOnly') return P.hourlyRate || '';
+    if (key === 'salaryRange') { const t = qa('[id*="SalaryType" i], [name*="SalaryType" i]').map((e) => (e.classList.contains('rw-dropdownlist') ? lbText(e) : textOf(e))).join(' '); return /hourly/i.test(t) ? P.hourlyRate || '' : String(P.salary || '').replace(/[^\d.]/g, ''); }
     if (key === 'salaryEither') return P.salary && P.hourlyRate ? `$${Number(String(P.salary).replace(/[^\d.]/g, '')).toLocaleString('en-US')} per year or $${P.hourlyRate} per hour` : P.salary || (P.hourlyRate ? `$${P.hourlyRate} per hour` : '');
     if (key === 'regulatoryNo') return P.criminalRecord === 'No' && P.securitiesLicense === 'No' ? 'No' : '';
     if (key === 'politicalNo') return /china|mainland/i.test(P.citizenship || '') ? 'No' : '';
@@ -637,14 +787,18 @@
       return workJobs().filter((j) => j.reason).slice(0, 4).map((j) => `${j.company} (${j.title}, ${j.start}–${j.current ? 'present' : j.end}): ${j.reason}`).join(' ') || '';
     }
     if (key === 'address1' && P.address1 && !P.address2 && /,\s*(apt|apartment|unit|suite|ste|#)\b/i.test(P.address1)
-      && qa('label').some((l) => isVisible(l) && /address (line )?2\b/i.test(textOf(l)))) return String(P.address1).split(/,\s*(?=(apt|apartment|unit|suite|ste|#)\b)/i)[0].trim();
+      && (qa('label').some((l) => isVisible(l) && /address (line )?2\b/i.test(textOf(l))) || (isSfXweb() && ui5All().some((h) => /address (line )?2\b/i.test(h.getAttribute('accessible-name') || ''))))) return String(P.address1).split(/,\s*(?=(apt|apartment|unit|suite|ste|#)\b)/i)[0].trim();
     if (key === 'address1Combo') return String(P.address1 || '').split(/,\s*(?=(apt|apartment|unit|suite|ste|#)\b)/i)[0].trim();
     if (key === 'address2' && !P.address2) { const m = String(P.address1 || '').match(/,\s*((apt|apartment|unit|suite|ste|#)\b.*)$/i); return m ? m[1].trim() : ''; }
     if (key === 'NONE_ABOVE') return 'None of the above';
     if (key === 'NO') return 'No';
     if (key === 'TERMS') return S.settings.acceptTerms ? 'CHECK' : '';
     if (key === 'preferredNameBox') return P.preferredName && P.preferredOnlyIfRequired !== 'Yes' ? 'CHECK' : '';
+    if (key === 'noMiddleName') return P.middleName ? '' : 'CHECK';
+    if (key === 'preferredNameYN') return P.preferredName && P.preferredOnlyIfRequired !== 'Yes' ? 'Yes' : 'No';
     if (key === 'AUTH_NO_SPONSOR') return P.needSponsorship === 'Yes' ? 'No' : P.workAuthorized;
+    if (key === 'sponsorSoon') return P.sponsorSoon || P.needSponsorship; // 资料没填就跟「要不要担保」一样
+    if (key === 'hoursPerWeek') return String(P.hoursPerWeek || 40);
     if (key === 'skills') return P.skills ? P.skills.split(/[,，;；]/).map((s) => s.trim()).filter(Boolean) : '';
     if (key === 'toolsCoursework' || key === 'toolsWork' || key === 'toolsAll') {
       const list = (s) => String(s || '').split(/[,，;；]/).map((x) => x.trim()).filter(Boolean);
@@ -719,7 +873,7 @@
   function degreeCands() {
     const d = String(S.profile.degree || '').trim();
     if (!d) return [];
-    if (/^master/i.test(d)) return ['Master of Science', 'Masters of Science', "Master's of Science", 'Master of Science (M.S.)', "Master's Degree", "Master's", 'M.S.', 'MS', 'Masters', d, 'Graduate'];
+    if (/^master/i.test(d)) return ['Master of Science', 'Masters of Science', "Master's of Science", 'Master of Science (M.S.)', "Master's Degree", "Master's", 'M.S.', 'MS', 'Masters', d, 'Graduate', '理学硕士', '硕士']; // 中文选项：BambooHR 跟着浏览器语言显示「大学 - 理学硕士」
     if (/^bachelor/i.test(d)) return [d, 'Bachelor', 'Bachelors', "Bachelor's", 'Undergraduate'];
     if (/^(phd|ph\.d|doctor)/i.test(d)) return [d, 'PhD', 'Ph.D', 'Doctorate', 'Doctoral'];
     return [d];
@@ -728,8 +882,8 @@
   function highestCands() {
     const d = String(S.profile.highestCompleted || '').trim();
     if (!d) return [];
-    if (/^bachelor/i.test(d)) return ["Bachelor's Degree", "Bachelor's", 'Bachelor', 'Bachelors', 'Undergraduate'];
-    if (/^master/i.test(d)) return ["Master's Degree", "Master's", 'Master', 'Masters', 'Graduate'];
+    if (/^bachelor/i.test(d)) return ["Bachelor's Degree", "Bachelor's", 'Bachelor', 'Bachelors', 'Undergraduate', '理学学士', '文学学士'];
+    if (/^master/i.test(d)) return ["Master's Degree", "Master's", 'Master', 'Masters', 'Graduate', '硕士'];
     return [d];
   }
 
@@ -780,10 +934,11 @@
       }).filter((x) => x && x.length >= 2);
       return [...new Set([...names, 'None of the above', 'None', 'No', 'N/A', 'Not applicable'])];
     }
-    if (key === 'veteran' && /^not a protected veteran$/i.test(P.veteran || '')) return ['I am not a veteran', 'Not a veteran', 'I have never served in the military', 'Never served', 'I am not a protected veteran', 'not a protected veteran', 'No, I do not believe', 'No'];
-    if (key === 'gender' && /^male$/i.test(P.gender || '')) return ['Male', 'Man', 'Cisgender man', 'Cisgender male', 'Cis man'];
-    if (key === 'gender' && /^female$/i.test(P.gender || '')) return ['Female', 'Woman', 'Cisgender woman', 'Cisgender female', 'Cis woman'];
-    if (key === 'disability' && /^no\b/i.test(P.disability || '')) return [P.disability, "No, I don't have a disability", "No, I don't", 'No'];
+    if (key === 'veteran' && /^not a protected veteran$/i.test(P.veteran || '')) return ['I am not a veteran', 'Not a veteran', 'I have never served in the military', 'Never served', 'I am not a protected veteran', 'not a protected veteran', 'No, I do not believe', 'No', '我不是退伍军人', '非退伍军人', '不是退伍军人', '我不是受保护的退伍军人', '否']; // 中文选项：BambooHR 跟着浏览器语言
+    if (key === 'gender' && /^male$/i.test(P.gender || '')) return ['Male', 'Man', 'Cisgender man', 'Cisgender male', 'Cis man', '男性', '男']; // 中文选项（Trident 的 BambooHR：拒绝回答 / 男性 / 女性）
+    if (key === 'gender' && /^female$/i.test(P.gender || '')) return ['Female', 'Woman', 'Cisgender woman', 'Cisgender female', 'Cis woman', '女性', '女'];
+    if (key === 'ethnicity' && /^asian$/i.test(P.ethnicity || '')) return ['Asian', 'Asian (Not Hispanic or Latino)', '亚洲人', '亚裔', '亚洲'];
+    if (key === 'disability' && /^no\b/i.test(P.disability || '')) return [P.disability, "No, I don't have a disability", "No, I don't", 'No', '不，我没有残疾', '我没有残疾', '没有残疾', '否'];
     if (key === 'previousWorker' && /^no$/i.test(P.previousWorker || '')) return ['No', 'I have never worked', 'Never worked', 'I have not worked', 'No, I have not', 'Not Applicable', 'N/A'];
     if (key === 'marketHours') return P.marketHours ? [P.marketHours, '4-5', '4 - 5', '4+', '4 or more', 'More than 4', 'Over 4', '4-6'] : [];
     if (key === 'REFS_TEXT') return refsText();
@@ -875,7 +1030,9 @@
           const req = !!(f && isRequired(f));
           if (S.profile.preferredOnlyIfRequired === 'Yes' && !req) ans.value = '';
           else if (!ans.value && req) ans.value = S.profile.firstName || '';
+          if (/(last|family|sur) ?name/.test(nq)) ans.value = req || S.profile.preferredOnlyIfRequired !== 'Yes' ? (S.profile.lastName || '') : '';
         }
+        if (r.key === 'referredBy' && kind === 'text' && !/were you referred|(have|has) (you|anyone) (been )?referred/.test(nq)) ans.value = f && isRequired(f) ? 'N/A' : '';
         if (f && kind === 'text' && /^(no|none)\.?$/i.test(String(ans.value || '').trim())) { const na = noneToken(f.el); if (na) ans.value = na; }
         if (r.key === 'otherSchool') { const sch = norm(S.profile.school || ''); ans.value = sch && (nq.includes(sch) || (/new york university/.test(sch) && /\bnyu\b/.test(nq))) ? 'Yes' : 'No'; }
         if (r.key === 'source') ans.fallback = ['Other', 'Other...', 'Others', 'Other (please specify)'];
@@ -962,6 +1119,15 @@
     return null;
   }
 
+  function salaryIdAnswer(f) {
+    if (f.kind !== 'text' || !/(min|max)(imum)?[-_.]?desired[-_.]?salary|desired[-_.]?salary[-_.]?(min|max)/i.test(`${f.el.id || ''} ${f.el.name || ''}`)) return null;
+    const v = valueFor('salaryRange');
+    return v ? { key: 'salaryRange', value: String(v) } : null;
+  }
+  function refGuard(f) {
+    if (!/(^|[^p])references?\b|(^|[^p])reference[-_.]/i.test(`${f.el.id || ''} ${f.el.name || ''}`)) return null;
+    return refAnswer(f) || { value: '' };
+  }
   function refAnswer(f) {
     if (f.block !== 'reference' || f.refIdx == null || !['text', 'select', 'combo', 'listbox', 'popcombo', 'radio'].includes(f.kind)) return null;
     const R = (S.profile.references || [])[f.refIdx];
@@ -980,7 +1146,13 @@
     return (S.profile.references || []).filter((r) => r.name).map((r) => [r.name, [r.relationship, r.company].filter(Boolean).join(', '), r.email, r.phone].filter(Boolean).join(' | ')).join('\n');
   }
 
+  function wrongPrefilledDegree(f) {
+    if (!f.ans || f.ans.key !== 'degree' || isEmpty(f) || !/^master/i.test(S.profile.degree || '')) return false;
+    const cur = f.kind === 'select' ? selectText(f) : ['popcombo', 'listbox'].includes(f.kind) ? popText(f.el) : String(f.el.value || '');
+    return /\bmaster'?s? of (technology|engineering|computing|commerce|arts|fine arts|education|public|social)\b|\bin data science\b|\bm\.?b\.?a\b|business administration/i.test(cur);
+  }
   function alreadyMatches(f, ans) {
+    if (wrongPrefilledDegree(f)) return false;
     const v = ans.value;
     if (Array.isArray(v)) return false;
     if (f.kind === 'text' || f.kind === 'date') return f.el.value === String(v);
@@ -1085,15 +1257,19 @@
 
   const PLACEHOLDER_OPT_RE = /^[-—–\s.]*(select|choose|please (select|choose)|no answer|none selected|pick one)\b[^a-z]*?[-—–\s.]*$|^[-—–\s.]*(select|choose|please select)\b|^[-—–\s.]*$/i;
   const isPlaceholderOpt = (o) => !!o && PLACEHOLDER_OPT_RE.test((o.text || '').trim());
-  const SUBSCRIBE_FORM_RE = /\b(subscribe|newsletter|sign ?up for (our )?(updates|news|emails?|insights)|stay (informed|in touch|updated|connected)|get (our )?(latest )?(news|insights|updates))\b/i;
+  const JOB_ALERT_FIELD_RE = /job[-_]?alert|alert[-_]?signup|talent[-_]?(community|network|signup|pool)|newsletter|subscribe|notifiedemail|email[-_]?(this[-_]?)?job|share[-_]?job|refer[-_]?a?[-_]?friend/i;
+  const SUBSCRIBE_FORM_RE = /\b(subscribe|newsletter|sign ?up for (our )?(updates|news|emails?|insights|job alerts?)|job alerts?|sign ?up|stay (informed|in touch|updated|connected)|get (our )?(latest )?(news|insights|updates))\b/i;
   const subscribeCache = new WeakMap();
   function isSubscribeForm(form) {
     if (!form) return false;
     if (subscribeCache.has(form)) return subscribeCache.get(form);
     const inputs = qa('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]), textarea, select', form).filter(isVisible);
     const btnText = qa('button, input[type=submit], [role=button]', form).map((b) => b.textContent || b.value || '').join(' ');
-    const yes = inputs.length <= 3 && !q('input[type=file], textarea', form) && inputs.some((e) => e.type === 'email' || /e-?mail/i.test(e.name || e.id || e.placeholder || ''))
-      && (SUBSCRIBE_FORM_RE.test(btnText) || SUBSCRIBE_FORM_RE.test((form.textContent || '').slice(0, 400)));
+    const yes = (inputs.length <= 3 && !q('input[type=file], textarea', form) && inputs.some((e) => e.type === 'email' || /e-?mail/i.test(e.name || e.id || e.placeholder || ''))
+      && (SUBSCRIBE_FORM_RE.test(btnText) || SUBSCRIBE_FORM_RE.test((form.textContent || '').slice(0, 400))))
+      || (inputs.length <= 8 && !q('input[type=file]', form) && /job alerts?|talent (community|network|pool)|join our talent|get (notified|alerts)/i.test((form.textContent || '').slice(0, 800) + ' ' + btnText))
+      || (inputs.length <= 5 && !q('input[type=file]', form) && /recipient|email (this|the) job|share (this|the) job|send (this|the) job|(to|tell) a friend|refer a friend|^\s*activate\s*$/i.test((form.textContent || '').slice(0, 600) + ' ' + btnText))
+      || (inputs.length <= 3 && !q('input[type=file]', form) && qa('input', form).some((i) => /notifiedemail|email-?job|jobalert|job-alert|share/i.test(`${i.name || ''} ${i.id || ''}`)));
     subscribeCache.set(form, yes);
     return yes;
   }
@@ -1103,12 +1279,13 @@
     const fields = [];
     const groups = new Map();
     const srInputs = isSR() ? shadowQa('input, textarea, select').filter((el) => !/dropdown-search|autocomplete/.test(hostTags(el))) : [];
-    for (const el of [...qa('input, textarea, select, button[aria-haspopup="listbox"]', scope), ...srInputs]) {
+    for (const el of [...qa('input, textarea, select, button[aria-haspopup="listbox"], .rw-dropdownlist[role="combobox"]', scope), ...srInputs]) {
       if (el.closest('#wdaf-host') || el.disabled) continue;
-      if (el.tagName === 'INPUT' && el.getAttribute('role') !== 'combobox' && !el.closest('.ant-select')
+      if (el.tagName === 'INPUT' && el.getAttribute('role') !== 'combobox' && !el.closest('.ant-select') && !isPromptInput(el)
         && (el.type === 'search' || /^search\b/i.test(el.placeholder || el.getAttribute('aria-label') || '') || /(^|[-_])(q|query|search|keywords?)($|[-_])/i.test(el.name || el.id || ''))) continue;
       if (el.closest('nav, [role="navigation"], header, [role="banner"], footer, [role="contentinfo"], [role="search"]') && !el.closest('form [id*="app" i], form[id*="app" i], #application, [data-qa="application"]')) continue;
       if (isSubscribeForm(el.closest('form'))) continue;
+      if (JOB_ALERT_FIELD_RE.test(`${el.id || ''} ${el.name || ''}`)) continue;
       if (el.id === 'location-input' && (q('input#selected-location')?.value || '').length > 5) continue; // Lever 所在地已从下拉选好：别再打字冲掉（Quest / Forbright 实测）
       if (/^(other response|其他回复)$/i.test(el.getAttribute('aria-label') || '')) {
         const li = el.closest('[role="listitem"]');
@@ -1123,14 +1300,17 @@
       }
       const choice = el.type === 'radio' || el.type === 'checkbox';
       const antd = el.tagName === 'INPUT' && el.closest('.ant-select');
-      if (!(isVisible(el) || (antd && isVisible(antd)) || (choice && ([...(el.labels || [])].some(isVisible) || isVisible(el.parentElement))))) continue;
+      const ttFs = el.closest && el.closest('fieldset');
+      const ttChoice = el.type === 'radio' && /\[answers_attributes\]\[\d+\]\[choice\]$/.test(el.name || '') && ttFs && isVisible(ttFs);
+      if (el.tagName === 'INPUT' && el.type === 'text' && !el.name && el.classList.contains('sr-only') && ttFs && q('input[type="radio"][name$="[choice]"]', ttFs)) continue;
+      if (!(isVisible(el) || ttChoice || (antd && isVisible(antd)) || (choice && ([...(el.labels || [])].some(isVisible) || isVisible(el.parentElement))))) continue;
       const aid = el.getAttribute('data-automation-id') || '';
       if (aid === 'beecatcher' || el.getAttribute('aria-hidden') === 'true') continue; // 防机器人的隐藏陷阱框，绝不能填
-      if (el.tagName === 'BUTTON') { fields.push({ kind: 'listbox', el }); continue; }
+      if (el.tagName === 'BUTTON' || el.classList.contains('rw-dropdownlist')) { fields.push({ kind: 'listbox', el }); continue; }
       if (el.tagName === 'SELECT') { fields.push({ kind: 'select', el }); continue; }
       if (el.tagName === 'TEXTAREA') { if (!el.readOnly) fields.push({ kind: 'text', el }); continue; }
       const t = el.type;
-      if (['hidden', 'submit', 'button', 'password', 'file', 'image', 'reset'].includes(t)) continue;
+      if (['hidden', 'submit', 'button', 'password', 'file', 'image', 'reset'].includes(t) || isSensitiveInput(el)) continue;
       if (/^dateSection/.test(aid)) continue; // 日期单独处理
       if (t === 'radio' || t === 'checkbox') {
         const box = el.closest('fieldset, [role="radiogroup"], [role="group"], [data-automation-id^="formField"]');
@@ -1152,6 +1332,10 @@
     }
     for (const el of qa('[role="combobox"]:not(input):not(select):not(textarea)', scope)) {
       if (el.closest('#wdaf-host') || !isVisible(el) || (el.tagName === 'BUTTON' && el.getAttribute('aria-haspopup') === 'listbox') || q('input, select, textarea', el)) continue;
+      fields.push({ kind: 'popcombo', el });
+    }
+    for (const el of qa('button.fab-SelectToggle', scope)) {
+      if (el.closest('#wdaf-host') || !isVisible(el)) continue;
       fields.push({ kind: 'popcombo', el });
     }
     for (const el of qa('[role="button"][aria-controls][aria-expanded]:not(button)', scope)) {
@@ -1186,6 +1370,23 @@
         if (inp) fields.push({ kind: 'combo', el: inp, srAc: ac, srMulti: true, srQ: srHostLabel(ac), srReq: ac.hasAttribute('required') });
       }
     }
+    if (isSfXweb()) {
+      const rg = new Map();
+      for (const h of ui5All()) {
+        const t = ui5Tag(h);
+        if (!isVisible(h) || h.hasAttribute('disabled') || h.hasAttribute('readonly') || h.closest('#wdaf-host')) continue;
+        const qn = zwClean(h.getAttribute('accessible-name') || '');
+        const req = h.hasAttribute('required');
+        if (t === 'input' || t === 'textarea') {
+          const inner = h.shadowRoot && h.shadowRoot.querySelector(t === 'textarea' ? 'textarea' : 'input');
+          if (!inner || !qn) continue;
+          fields.push(h.hasAttribute('show-suggestions') ? { kind: 'combo', el: inner, ui5: h, ui5Sug: true, srQ: qn, srReq: req } : { kind: 'text', el: inner, ui5: h, srQ: qn, srReq: req });
+        } else if (t === 'select' && qn) fields.push({ kind: 'ui5sel', el: h, ui5: h, srQ: qn, srReq: req });
+        else if (t === 'checkbox') fields.push({ kind: 'checkbox', el: h, ui5: h, srQ: qn || zwClean(h.getAttribute('text')), srReq: req });
+        else if (t === 'radio-button') { const k = h.getAttribute('name') || 'r'; if (!rg.has(k)) rg.set(k, []); rg.get(k).push(h); }
+      }
+      for (const els of rg.values()) fields.push({ kind: 'radio', el: els[0], els, ui5: els[0], srQ: ui5GroupQ(els[0]), srReq: els.some((e) => e.hasAttribute('required')) });
+    }
     for (const g of groups.values()) {
       if (g.kind === 'checkbox' && g.els.length === 1) fields.push({ kind: 'checkbox', el: g.els[0] });
       else fields.push({ kind: g.kind === 'radio' ? 'radio' : 'checkgroup', el: g.els[0], els: g.els });
@@ -1210,12 +1411,15 @@
     let refIdx = null; // 推荐人：D.A. Davidson（Lever）「1. Name / Relationship / Email Address / Phone Number / How long have you know this reference? / 2. Name …」
     for (const f of fields) {
       const q = norm(f.question);
-      const rn = q.match(/^(\d)\s*[.)]\s*(full )?name$/);
+      const inRefCard = !!(f.el.closest && f.el.closest('.card') && /^(professional |personal |work )?references?\b/i.test(cleanLabel(textOf(f.el.closest('.card').querySelector(':scope > .card-header')))));
+      const rn = q.match(inRefCard ? /^(\d)\s*[.)]?\s*(full )?name$/ : /^(\d)\s*[.)]\s*(full )?name$/);
       if (rn && Number(rn[1]) <= 5) { refIdx = Number(rn[1]) - 1; f.block = 'reference'; f.refIdx = refIdx; continue; }
       if (refIdx !== null) {
         if (/^(relationship|email( address)?|e-?mail|phone( number)?|telephone|company|organi[sz]ation|employer|title|position|job title|how long|years (known|of acquaintance))/.test(q)) { f.block = 'reference'; f.refIdx = refIdx; continue; }
         refIdx = null;
       }
+      const ch = f.el.closest && f.el.closest('.card') && f.el.closest('.card').querySelector(':scope > .card-header');
+      if (ch && /^(most recent|current( or most recent)?|last|present) (employment|employer|job|position)/i.test(cleanLabel(textOf(ch)))) { f.block = 'employer'; f.empIdx = 0; continue; }
       const gh = (f.el.id || '').match(/^(company-name|title|start-date-month|start-date-year|end-date-month|end-date-year|current-role)-(\d+)/);
       if (gh) { f.block = 'employer'; f.empIdx = Number(gh[2]); continue; }
       const ph = `${f.el.id || ''} ${f.el.name || ''}`.match(/work-?history\b[^0-9]{0,24}?(\d+)(?!\d)/i);
@@ -1274,8 +1478,11 @@
       || el.parentElement?.parentElement || el;
   }
   const elSelectValue = (el) => { const p = q('.el-select__placeholder:not(.is-transparent)', comboBox(el)); return p ? textOf(p) : ''; };
+  const lbText = (el) => textOf((el.classList && el.classList.contains('rw-dropdownlist') && q('.rw-dropdownlist-value, .rw-input', el)) || el);
   function comboValue(el) {
     if (el.value.trim()) return el.value.trim();
+    const ngs = el.closest && el.closest('ng-select, .ng-select');
+    if (ngs) { const v = qa('.ng-value-label', ngs).map(textOf).filter(Boolean).join(', '); if (v) return v; }
     if (elSelectValue(el)) return elSelectValue(el);
     const ant = el.closest('.ant-select') && q('.ant-select-selection-item', el.closest('.ant-select'));
     if (ant) return ant.getAttribute('title') || textOf(ant);
@@ -1352,11 +1559,12 @@
   }
 
   function isEmpty(f) {
+    if (f.ui5 && f.kind !== 'checkbox' && f.kind !== 'radio') return f.kind === 'ui5sel' ? !ui5SelText(f.el) || /^(not selected|select|please select|-+)$/i.test(ui5SelText(f.el)) : !ui5Val(f.ui5);
     switch (f.kind) {
-      case 'text': case 'date': return !f.el.value.trim();
-      case 'combo': return f.srAc ? !srAcPicked(f) : !comboValue(f.el);
+      case 'text': case 'date': return !f.el.value.trim() && !tagChips(f.el).length;
+      case 'combo': return (f.srAc ? !srAcPicked(f) : !comboValue(f.el)) || siteSaysRequired(f.el);
       case 'select': return f.s2 ? select2Empty(f.s2) : (!f.el.value || !f.el.selectedOptions.length || isPlaceholderOpt(f.el.selectedOptions[0]));
-      case 'listbox': return /^(select one|select|)$/i.test(textOf(f.el));
+      case 'listbox': return /^(select one|select|-{1,3}|)$/i.test(lbText(f.el)); // Paylocity react-widgets 没选时显示「--」
       case 'popcombo': return POP_EMPTY_RE.test(popText(f.el));
       case 'prompt': return !hasSelection(f.el);
       case 'radio': case 'checkgroup': return !f.els.some(isChecked);
@@ -1366,12 +1574,14 @@
   }
 
   const errorRequired = new WeakSet();
-  const REQ_ERR_RE = /^(this field is required|this is a required field|required|field is required|this question is required|please (select|choose|enter|fill( in| out)?|complete|answer|provide) .{0,40})\.?$/i;
+  const REQ_ERR_RE = /^(this field is required|this is a required field|required|field is required|this question is required|please (select|choose|enter|fill( in| out)?|complete|answer|provide) .{0,40}|.{1,80} (is required|(must not|cannot|can't|may not) be (empty|blank)))\.?$/i;
+  const fieldErrText = (el) => (el && el.id ? textOf(document.getElementById(el.id + '-errorMsg') || document.getElementById(el.id + '-error')) : '') || '';
+  const siteSaysRequired = (el) => REQ_ERR_RE.test(fieldErrText(el).trim());
   function markErrorRequired() {
     const out = [];
     const fields = collectFields();
     for (const e of qa('div, span, p, small, li, [role="alert"]')) {
-      if (e.children.length > 1 || !isVisible(e) || e.closest('#wdaf-host') || !REQ_ERR_RE.test(textOf(e))) continue;
+      if (e.children.length > 1 || !isVisible(e) || e.closest('#wdaf-host') || e.closest(SR_ONLY) || !REQ_ERR_RE.test(textOf(e))) continue;
       let box = e.parentElement;
       for (let i = 0; i < 6 && box; i++, box = box.parentElement) {
         const file = q('input[type="file"]', box);
@@ -1483,8 +1693,8 @@
     target.scrollIntoView({ block: 'nearest' });
     target.click();
     await sleep(350);
-    if (isVisible(lb) && /^(select one|)$/i.test(textOf(btn))) { mouseClick(target); await sleep(350); }
-    return !/^(select one|)$/i.test(textOf(btn));
+    if (isVisible(lb) && /^(select one|-{1,3}|)$/i.test(lbText(btn))) { mouseClick(target); await sleep(350); }
+    return !/^(select one|-{1,3}|)$/i.test(lbText(btn));
   }
 
   function pillCount(input) {
@@ -1552,6 +1762,7 @@
   }
 
   function clickChoice(el) {
+    if (isAshbyYesNo(el) && isChecked(el)) return true; // Ashby 的是 / 否：再点就取消了
     if (el.tagName === 'SPL-RADIO') { srFire((el.shadowRoot && el.shadowRoot.querySelector('label')) || el); return isChecked(el); } // SmartRecruiters：点影子里的 label 才选上
     el.click();
     const inner = el.tagName !== 'INPUT' && el.querySelector && el.querySelector('input[type="radio"]');
@@ -1590,6 +1801,7 @@
   function optionEls(root) {
     let els = qa('[role="option"]', root);
     if (!els.length) els = qa('[role="row"]', root).filter((r) => !q('[role="columnheader"]', r)).map((r) => q('[role="gridcell"]', r) || r);
+    if (!els.length) els = qa('[role="menuitem"]', root); // BambooHR fabric 下拉：div[role=menu] > div[role=menuitem]
     if (!els.length) els = qa('[role="listitem"]', root); // Paylocity 的下拉：div[role=list] > div[role=listitem]
     if (!els.length) els = qa('li', root);
     if (!els.length) els = qa('[class*="__option"], [id*="-option-"]', root);
@@ -1635,12 +1847,17 @@
       const rows = qa('[role="listitem"]', plc).filter(isVisible).map((el) => ({ el, text: textOf(el) })).filter((o) => o.text && !/^(no results|no options)/i.test(o.text));
       if (rows.length) return rows;
     }
-    const id = input.getAttribute('aria-controls') || input.getAttribute('aria-owns');
-    const own = id && document.getElementById(id);
+    const own = ctlEl(input, input.getAttribute('aria-controls') || input.getAttribute('aria-owns'));
     const roots = own && isVisible(own) ? [own] : qa('[role="listbox"]').filter((l) => isVisible(l) && !l.closest('#wdaf-host'));
     return roots.flatMap(optionEls).filter(isVisible)
-      .map((el) => ({ el, text: textOf(el) }))
+      .map((el) => ({ el, text: textOf(q('[class*="canonicalSchoolResultName"]', el) || el) }))
       .filter((o) => o.text && !/^(no options|no results|no items|loading)/i.test(o.text));
+  }
+
+  function ctlEl(input, id) {
+    if (!id) return null;
+    const e = document.getElementById(id);
+    return e && e !== input ? e : qa(`[id="${CSS.escape(id)}"]`).find((x) => x !== input) || null;
   }
 
   function comboSaysNoOptions(input) {
@@ -1650,7 +1867,7 @@
   }
 
   function comboPicked(input, optText) {
-    if (q('[class*="single-value"], [class*="singleValue"], [class*="multi-value"], [class*="multiValue"], .MuiChip-root, .Select-value-label, .ant-select-selection-item', comboBox(input))) return true;
+    if (q('[class*="single-value"], [class*="singleValue"], [class*="multi-value"], [class*="multiValue"], .MuiChip-root, .Select-value-label, .ant-select-selection-item, .ng-value-label', comboBox(input)) || (input.closest('ng-select, .ng-select') && q('.ng-value-label', input.closest('ng-select, .ng-select')))) return true;
     if (elSelectValue(input) && norm(elSelectValue(input)) === norm(optText)) return true; // el-select 选上后文字在旁边的 span 里
     const stillOpen = input.getAttribute('aria-expanded') === 'true' && qa('[role="listbox"]').some((l) => isVisible(l) && !l.closest('#wdaf-host'));
     if (stillOpen || input.getAttribute('aria-invalid') === 'true') return false;
@@ -1723,6 +1940,21 @@
 
   async function clickComboOption(input, hit) {
     const optText = hit.text;
+    if (input.classList.contains('rbt-input-main')) {
+      const menu = ctlEl(input, input.getAttribute('aria-controls')) || input.closest('.rbt')?.querySelector('.rbt-menu');
+      const items = menu ? qa('[role="option"], .dropdown-item', menu).filter(isVisible) : [];
+      const idx = items.indexOf(hit.el.closest('[role="option"], .dropdown-item') || hit.el);
+      if (idx >= 0) {
+        for (let i = 0; i <= idx; i++) { pressKey(input, 'ArrowDown'); await sleep(60); }
+        pressKey(input, 'Enter');
+        await sleep(400);
+        input.blur();
+        await sleep(300);
+        if (norm(input.value) === norm(optText)) return true;
+        dbg('rbt 回车没选上', questionFor(input), optText);
+        return false;
+      }
+    }
     const target = q('a[role="menuitem"], [role="menuitem"]', hit.el) || hit.el;
     target.scrollIntoView?.({ block: 'nearest' });
     if (target !== hit.el) mouseClick(target); else target.click();
@@ -1757,7 +1989,8 @@
     }
     const full = [...new Set(cands.filter(Boolean).map(String))];
     const firstWords = full.map((t) => t.split(/[\s,(/]+/)[0]).filter((w) => w.length >= 3 && !full.some((t) => norm(t) === norm(w)));
-    const terms = [...new Set([...full, ...firstWords])];
+    const trimmed = full.filter((t) => t.length >= 12).map((t) => t.slice(0, t.length - 6).trim()).filter((w) => !full.includes(w));
+    const terms = [...new Set([...full, ...trimmed, ...firstWords])];
     for (const maxLevel of [1, 3]) {
       for (const term of terms) {
         if (!running) return false;
@@ -1829,7 +2062,7 @@
       const d = new Date(P.availableStart);
       if (!isNaN(d)) return { month: d.getMonth() + 1, day: d.getDate(), year: d.getFullYear() };
     }
-    if (/^date$|today|signed|signature date/.test(label)) {
+    if (/^date$|today|signed|signature date|date on which you (have )?(read|agreed|accepted|acknowledged)|acknowledg\w* date|date of (acknowledg\w*|agreement|consent)/.test(label)) {
       const d = new Date();
       return { month: d.getMonth() + 1, day: d.getDate(), year: d.getFullYear() };
     }
@@ -1861,6 +2094,15 @@
     if (!job || (d.to && job.current)) return null;
     const mm = String((d.to ? job.end : job.start) || '').match(/^(\d{1,2})\/(\d{4})$/);
     return mm ? dateParts(d.part, mm[1], mm[2]) : null;
+  }
+  const STILL_STUDENT_CB_RE = /\bstill (a )?student\b|\b(i )?(currently|still) (attend|attending|enrolled|studying)( here)?\??$/;
+  function stillStudentBox(f) {
+    if (f.kind !== 'checkbox' || !STILL_STUDENT_CB_RE.test(norm(f.question)) || S.profile.enrolled === 'No') return null;
+    const entry = f.el.closest('.ashby-application-form-input-education-entry, fieldset');
+    const school = norm((entry ? qa('input:not([type]), input[type="text"], input[type="search"]', entry) : []).map((i) => i.value).find(Boolean) || '');
+    const mine = norm(S.profile.school || '');
+    if (school && mine && !mine.startsWith(school) && !school.includes(mine)) return null;
+    return { value: 'CHECK' };
   }
   function pinpointEduAnswer(f) {
     const fs = isPinpoint() && f.el.closest('fieldset');
@@ -1904,8 +2146,14 @@
     else if (/start date|date started|^from\b|start \(/.test(q)) return part(job.start);
     else if (/end date|date (ended|left)|^to\b|end \(/.test(q)) return job.current ? (/month|year/.test(q) ? null : { value: 'Present' }) : part(job.end);
     else if (/job title|position title|^title$|^position$/.test(q)) v = job.title;
+    else if (/hours? (per|a|each) week|weekly hours|hours ?\/ ?week|hrs ?(per|\/) ?(week|wk)/.test(q)) v = String(job.hoursPerWeek || job.hours || (/part[- ]?time/i.test(`${job.title || ''} ${job.type || ''}`) ? 20 : 40));
     else if (/^may we contact|contact (this|the) employer|ok to contact|permission to contact/.test(q)) { if (job.current) return null; v = 'Yes'; }
     else if (/^country\b/.test(q)) { v = job.country || (/china/i.test(job.location || '') ? 'China' : null); return v ? { value: v, empAddr: true, first: true } : null; } // 先填国家：改了会刷新下面的地址栏
+    else if (/-us-state\b|-county\b|-zip\b/.test(f.el.id || '') && !/united states|^usa?$/i.test(job.country || '')) {
+      if (/-county\b/.test(f.el.id) && (job.adminArea || job.county)) return { value: job.adminArea || job.county, key: 'empStreet', empAddr: true };
+      if (/-zip\b/.test(f.el.id) && job.zip) return { value: job.zip, key: 'empStreet', empAddr: true };
+      return { value: '' };
+    }
     else if (/^(state|province|region|administrative area)\b/.test(q)) addr = v = (/administrative area/.test(q) && job.adminArea) || job.state || (/china/i.test(job.country || job.location || '') ? job.city : null) || null; // Paylocity「Administrative Area」：资料里该雇主的 adminArea（区）；没有就按国家：中国的公司没有州，填城市（直辖市）
     else if (/^county\b/.test(q)) addr = v = job.county || null;
     else if (/^(zip|postal)/.test(q)) return job.zip ? { value: job.zip, key: 'empStreet', empAddr: true } : null; // Paylocity 的邮编也是联想框（200120 联想不出来）：直接写
@@ -1931,6 +2179,10 @@
   function textDateAnswer(f) {
     if (f.kind !== 'text' || f.block === 'employer' || f.block === 'reference') return null;
     const q = norm(f.question);
+    if (/date/i.test(f.el.id || f.el.name || '') && !/mm\s*\/\s*(yyyy|yy)\b(?!\s*\/)|yyyy-mm/.test(norm(f.el.getAttribute('placeholder')) + ' ' + q)) {
+      const w = dateWanted(f.question);
+      if (w && w.month && w.day && w.year) return { value: `${pad2(w.month)}/${pad2(w.day)}/${w.year}` };
+    }
     const ph = norm(f.el.getAttribute('placeholder'));
     const iso = /^yyyy-mm$/.test(ph) || /\byyyy-mm\b(?!-)|year-month/.test(q);
     if (iso && !/graduat|degree|school|education|enrol|stud(y|ies|ent)/.test(q)) return null;
@@ -1980,8 +2232,12 @@
 
   function ackAnswer(f) {
     if (!S.settings.acceptTerms) return null;
-    if (f.kind === 'checkbox') return /^(i have read|i acknowledge|i understand|acknowledged|understood|i consent|i agree|i accept|(you|i) declare that (you|i) (have )?read|i hereby (grant|give|authori[sz]e|consent|certify|acknowledge|agree)|allow us to (process|store|use|hold) (your|my) (personal )?(information|data))\b/i.test(choiceLabel(f.el).trim().replace(/^\(required\)\s*/i, '')) && !/marketing|newsletter|promotional|talent (community|network|pool)|job alert|text message|\bsms\b|whatsapp|future (job )?(opportunit|openings)/i.test(f.question) ? { value: 'CHECK' } : null;
+    if (f.kind === 'checkbox') return /^(i have read|i acknowledge|i understand|acknowledged|understood|i consent|i agree|i accept|(you|i) declare that (you|i) (have )?read|i hereby (grant|give|authori[sz]e|consent|certify|acknowledge|agree)|allow us to (process|store|use|hold) (your|my) (personal )?(information|data))\b/i.test(choiceLabel(f.el).trim().replace(/^\(required\)\s*/i, '')) && !/marketing|newsletter|promotional|talent (community|network|pool)|job alert|text message|\bsms\b|whatsapp|future (job )?(opportunit|openings)/i.test(choiceLabel(f.el) + ' ' + (f.question.length <= 200 ? f.question : '')) ? { value: 'CHECK' } : null; // 题目是一大段声明时（Paycom 签名区：声明里提到 future employment…）只看勾选框自己的字
     if (f.kind === 'checkgroup' && f.els.length === 1) { const t = choiceLabel(f.els[0]); return /^(i have read|i acknowledge|i understand|acknowledged|understood)\b/i.test(t.trim()) ? { value: t } : null; }
+    if (f.kind === 'checkgroup') {
+      const acks = f.els.map(choiceLabel).map((t) => String(t || '').trim()).filter((t) => /^(i have read|i acknowledge|i hereby (acknowledge|certify|agree|attest)|i certify|i understand and agree)\b/i.test(t) && !/marketing|newsletter|text message|\bsms\b|job alert/i.test(t));
+      if (acks.length) return { value: acks };
+    }
     if (f.kind !== 'radio' || f.els.length !== 1) return null;
     const t = choiceLabel(f.els[0]);
     return /i have read|i acknowledge|i understand|acknowledged/i.test(t) ? { value: t } : null;
@@ -2016,19 +2272,30 @@
   }
 
 
-  const POP_EMPTY_RE = /^$|make a selection|^select( one| an option)?\b|^choose\b|^please select|^[-—–\s]+$/i;
+  const POP_EMPTY_RE = /^$|make a selection|^select( one| an option)?\b|^choose\b|^please select|^[-—–\s]+$|^请选择/i;
   const popText = (el) => cleanLabel(textOf(el)).replace(/^[-—–\s]+|[-—–\s]+$/g, '');
   async function openPopCombo(el) {
     comboBefore.set(el, new Set(visiblePopups()));
-    if (el.getAttribute('aria-expanded') !== 'true') mouseClick(el);
-    const ctlOpts = () => { const c = document.getElementById(el.getAttribute('aria-controls') || ''); return c && isVisible(c) ? optionEls(c).filter(isVisible).map((o) => ({ el: o, text: textOf(o) })).filter((o) => o.text && o.text.length <= 150) : []; };
+    const fab = el.classList.contains('fab-SelectToggle');
+    if (fab) { el.scrollIntoView?.({ block: 'center' }); await sleep(200); }
+    if (el.getAttribute('aria-expanded') !== 'true') {
+      const panel = fab && document.getElementById('wdaf-host');
+      const pv = panel ? panel.style.visibility : '';
+      if (panel) panel.style.visibility = 'hidden';
+      const ok = fab && (await trustedClick(el).catch(() => false));
+      if (panel) panel.style.visibility = pv;
+      if (!ok) mouseClick(el);
+    }
+    const ctlOpts = () => { const c = ctlEl(el, el.getAttribute('aria-controls') || ''); return c && (fab || isVisible(c)) ? optionEls(c).filter((o) => fab || isVisible(o)).map((o) => ({ el: o, text: textOf(o) })).filter((o) => o.text && o.text.length <= 150) : []; };
     const opts = await waitFor(() => { const c = ctlOpts(); const o = (c.length ? c : popupOptions(el)).filter((x) => !POP_EMPTY_RE.test(popText(x.el))); return o.length ? o : null; }, 2500, 150);
     return opts || [];
   }
   function closePopCombo(el) {
-    if (el.getAttribute('aria-expanded') === 'true' || newPopups(el).length) mouseClick(el);
+    if (el.getAttribute('aria-expanded') === 'true' || newPopups(el).length) { if (el.classList.contains('fab-SelectToggle')) pressKey(el, 'Escape'); else mouseClick(el); }
   }
   async function fillPopCombo(el, cands, ans) {
+    const icSel = /_icimsDropdown$/.test(el.id || '') && document.getElementById(el.id.replace(/_icimsDropdown$/, ''));
+    if (icSel && icSel.hasAttribute('icimsdropdown-ajax')) return fillIcimsAjax(icSel, cands, ans);
     let opts = await openPopCombo(el);
     let hit = opts.length ? chooseOption(opts, cands, ans) : null;
     const pop = newPopups(el).find((x) => q('input', x));
@@ -2044,8 +2311,8 @@
     dbg('popcombo', questionFor(el), '| 选项', opts.length, opts.slice(0, 8).map((o) => o.text), '| 命中', hit && hit.text);
     if (!hit) { comboDiag(el, cands, opts); closePopCombo(el); return false; }
     hit.el.scrollIntoView?.({ block: 'nearest' });
-    mouseClick(hit.el);
-    const ok = await waitFor(() => !POP_EMPTY_RE.test(popText(el)), 1500, 150);
+    if (!(el.classList.contains('fab-SelectToggle') && (await trustedClick(hit.el).catch(() => false)))) mouseClick(hit.el);
+    const ok = await waitFor(() => !POP_EMPTY_RE.test(popText(el)) && (!el.classList.contains('fab-SelectToggle') || pickAny([{ el, text: popText(el) }], [hit.text], 2)), 1500, 150);
     if (!ok) closePopCombo(el);
     return !!ok;
   }
@@ -2150,6 +2417,24 @@
   async function fillFieldInner(f, ans) {
     const v = ans.value;
     const cands = candsOf(ans);
+    if (f.ui5) {
+      if (f.kind === 'checkbox') {
+        if (v !== 'CHECK' && !/^(yes|true|check)$/i.test(v)) return false;
+        if (!isChecked(f.el)) { f.el.click(); await sleep(250); if (!isChecked(f.el)) await trustedClick(f.el); }
+        return isChecked(f.el);
+      }
+      if (f.kind === 'radio') {
+        const hit = chooseOption(f.els.map((el) => ({ el, text: choiceLabel(el) })), cands, ans);
+        if (!hit) return false;
+        hit.el.click(); await sleep(250);
+        if (!isChecked(hit.el)) await trustedClick(hit.el);
+        return isChecked(hit.el);
+      }
+      if (Array.isArray(v)) return false;
+      if (f.kind === 'ui5sel') { const hit = chooseOption(ui5Options(f.el), cands, ans); return !!hit && (await ui5SelectSet(f.el, hit.el)); }
+      if (f.ui5Sug) return fillUi5Suggest(f, cands);
+      return fillUi5Text(f, String(v));
+    }
     switch (f.kind) {
       case 'text': {
         if (Array.isArray(v)) return false;
@@ -2160,10 +2445,14 @@
           if (us && cs.value !== us.value) { setNative(cs, us.value); await sleep(300); }
           if (cs) { setText(f.el, '+1' + String(v).replace(/\D/g, '')); return true; }
         }
+        if (f.el.closest(TAG_BOX)) { await addTags(f.el, v); return true; }
+        if (await fillFocusDate(f.el, v)) return true;
         setText(f.el, v);
+        if (!f.el.value.trim() && /mm\s*\/\s*dd|dd\s*\/\s*mm/i.test(f.el.getAttribute('placeholder') || '') && (await trustedType(f.el, String(v)))) { await sleep(300); f.el.blur(); }
         return true;
       }
       case 'select': {
+        if (f.el.hasAttribute('icimsdropdown-ajax')) return fillIcimsAjax(f.el, cands, ans);
         const ready = () => !f.el.isConnected || [...f.el.options].some((o) => o.value !== '');
         if (!ready()) await waitFor(ready, 3000, 200);
         if (!f.el.isConnected) return 'stale'; // 等的时候页面把这个下拉框重建了，重新扫描再填
@@ -2240,7 +2529,8 @@
     const a = fileAnchor(input);
     let zone = a === input ? input.parentElement : a;
     for (let p = zone, i = 0; p && i < 6 && textOf(p).length < 600; i++, p = p.parentElement) {
-      if (qa('input[type="file"], .dz-clickable', p).filter((x) => x !== a && !a.contains(x)).length > (a === input ? 1 : 0)) break;
+      const others = qa('input[type="file"], .dz-clickable', p).filter((x) => x !== a && !a.contains(x) && !x.contains(a));
+      if (others.length > (a === input ? 1 : 0) || others.some((x) => x.type === 'file' && x.getClientRects().length > 0)) break; // 上传框本身常是透明的，isVisible 认不出：只要排了版（不是 display:none）就算
       zone = p;
     }
     return zone || document.body;
@@ -2260,20 +2550,28 @@
     if (/apply-with-resume|autofill|parse/i.test(hostAttr(el, 'data-test'))) return true; // SmartRecruiters 顶上「用简历自动填」的上传框
     let e = el;
     for (let i = 0; i < 4 && e && e !== document.body; i++, e = e.parentElement) {
-      if (AUTOFILL_UP_RE.test(textOf(e).slice(0, 300)) && qa('input[type="file"]', e).length <= 1) return true;
+      const t = textOf(e).slice(0, 300);
+      if (AUTOFILL_UP_RE.test(t) && !(/upload (your |a )?(resume|cv)/i.test(t) && !/autofill|auto-fill|parse/i.test(t)) && qa('input[type="file"]', e).length <= 1) return true;
     }
     return false;
   }
 
   function resumeInputs() {
+    if (isSfXweb()) {
+      const ups = ui5All().filter((h) => ui5Tag(h) === 'file-uploader' && h.shadowRoot && isVisible(h)).map((h) => ({ h, i: h.shadowRoot.querySelector('input[type="file"]') })).filter((x) => x.i && !x.i.disabled);
+      const ctx = (h) => { for (let e = h.parentElement, k = 0; e && k < 14; e = e.parentElement, k++) { const t = norm(textOf(e)); if (t.length > 15) return t.slice(0, 300); } return ''; };
+      const res = ups.filter((x) => /resume|\bcv\b|curriculum/.test(ctx(x.h)) && !/cover letter|transcript/.test(ctx(x.h).slice(0, 80)));
+      return (res.length ? res : ups.length === 1 ? ups : []).map((x) => x.i);
+    }
     const ctx = fileCtxOwn;
-    const raw = [...qa('input[type="file"]'), ...(isSR() ? shadowQa('input[type="file"]') : [])].filter((i) => !i.disabled && !i.closest('#wdaf-host'));
+    const raw = [...qa('input[type="file"]'), ...(isSR() ? shadowQa('input[type="file"]') : [])].filter((i) => !i.disabled && !i.closest('#wdaf-host') && !/^pdfViewer_/i.test(i.id || ''));
     const real = raw.filter((i) => !inAutofillZone(i));
     const all = real.length ? real : raw;
     const byName = all.filter((i) => /(^|[^a-z])(cv|resume)([^a-z]|$)/i.test(i.name || i.id || '') && !/cover|letter|transcript/i.test(i.name || i.id || ''));
     if (byName.length) return byName;
     const scored = all.map((i) => ({ i, t: ctx(i) }));
-    const resume = scored.filter((s) => /resume|\bcv\b|curriculum/.test(s.t) && !/cover|transcript|letter|portfolio|writing sample/.test(s.t));
+    const OTHER_DOC = /cover|transcript|letter|portfolio|writing sample/;
+    const resume = scored.filter((s) => /resume|\bcv\b|curriculum/.test(s.t) && (!OTHER_DOC.test(s.t) || (/resume|\bcv\b|curriculum/.test(s.t.slice(0, 120)) && !OTHER_DOC.test(s.t.slice(0, 120)))));
     if (resume.length) return resume.map((s) => s.i);
     const vague = scored.filter((s) => !/resume|\bcv\b|curriculum|cover|transcript|letter|motivation|portfolio|writing|sample|certificat|licen|enrol|proof/.test(s.t));
     const byCtx = vague.find((s) => /resume|\bcv\b|curriculum/.test(fileCtx(s.i)) && !/cover|transcript|motivation|portfolio|writing sample/.test(fileCtx(s.i).replace(/upload your cv|resume\/cv|cv\/resume/g, '')));
@@ -2779,8 +3077,9 @@
   let pending = []; // 上次标红、插件没有规则可答的题；你手动答完后记下来
 
   function fieldAnswer(f) {
+    if (f.ui5 && f.kind !== 'checkbox' && f.kind !== 'radio') return f.kind === 'ui5sel' ? ui5SelText(f.el) : ui5Val(f.ui5);
     switch (f.kind) {
-      case 'listbox': return textOf(f.el);
+      case 'listbox': return lbText(f.el);
       case 'popcombo': return isEmpty(f) ? '' : popText(f.el);
       case 'combo': return comboValue(f.el);
       case 'select': return selectText(f);
@@ -3015,7 +3314,7 @@
   const opTried = new Set(); // 这一页已经让 AI 试过的题
   const recipeKey = (f) => location.hostname + '|' + norm(f.question).slice(0, 120);
 
-  const ATS_FAMILY = ['myworkdayjobs.com', 'myworkdaysite.com', 'icims.com', 'oraclecloud.com', 'successfactors.com', 'sapsf.com', 'paylocity.com', 'paradox.ai',
+  const ATS_FAMILY = ['myworkdayjobs.com', 'myworkdaysite.com', 'icims.com', 'oraclecloud.com', 'successfactors.com', 'successfactors.eu', 'sapsf.com', 'sapsf.eu', 'paylocity.com', 'paradox.ai',
     'greenhouse.io', 'lever.co', 'jobvite.com', 'taleo.net', 'ultipro.com', 'ukg.net', 'smartrecruiters.com', 'ashbyhq.com', 'workable.com', 'applytojob.com', 'paychex.com', 'adp.com'];
   const atsOf = () => ATS_FAMILY.find((d) => location.hostname === d || location.hostname.endsWith('.' + d)) || '';
   const atsRecipeKey = (f) => (atsOf() ? 'ats:' + atsOf() + '|' + norm(f.question).slice(0, 120) : '');
@@ -3036,7 +3335,7 @@
   function opSnapshot(f, box) {
     const items = [];
     const add = (el, popup) => {
-      if (items.length >= 90 || el.closest('#wdaf-host') || !isVisible(el) || items.some((x) => x.el === el)) return;
+      if (items.length >= 90 || el.closest('#wdaf-host') || !isVisible(el) || isSensitiveInput(el) || items.some((x) => x.el === el)) return;
       if (el.tagName === 'LI' && q(OP_SEL.replace(/, li$/, ''), el)) return; // li 里有更具体的控件，用那个
       const isField = /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
       const state = ['checked', 'selected', 'expanded', 'pressed'].filter((a) => el.getAttribute('aria-' + a) === 'true' || (a === 'checked' && el.checked)).join(',');
@@ -3116,6 +3415,7 @@
     switch (a.type) {
       case 'click':
         if (isButtonish && !isAriaChoice(el) && !item.popup && OP_DANGER_RE.test(name) && !/open the drop-?down|show (all|options)|toggle/i.test(name)) return 'blocked: dangerous button';
+        if ((isAshbyYesNo(el) || el.getAttribute('role') === 'radio') && isChecked(el)) return 'ok';
         el.scrollIntoView?.({ block: 'nearest' });
         mouseClick(el);
         return 'ok';
@@ -3251,6 +3551,120 @@
     return fixed;
   }
 
+  const ADV_SEL = 'button, a[href], [role="button"], [role="tab"], [role="link"], [role="menuitem"], summary, [aria-expanded], input[type="button"], input[type="submit"], [tabindex]:not([tabindex="-1"]), [onclick]';
+  const ADV_DANGER_RE = /delete|remove|withdraw|cancel|sign ?(in|out|up)|log ?(in|out)|register|create (an? |your )?(account|login|profile)|upload|attach|browse|download|import|clear|reset|^back\b|previous|go back|exit|quit|leave|unsubscribe|captcha|not a robot|verify (you|that|me)|cookie|accept all|reject|decline|share|print|tweet|facebook|linkedin|twitter/i;
+  const advTried = new Map(); // 网址 + 原因 → 试过几轮
+  function advSnapshot() {
+    const items = [];
+    const seen = new Set();
+    const add = (el, inView) => {
+      if (items.length >= 80 || seen.has(el)) return;
+      const r = el.getBoundingClientRect();
+      const view = r.width > 0 && r.height > 0 && r.bottom >= 0 && r.top <= window.innerHeight && r.right >= 0 && r.left <= window.innerWidth;
+      if (view !== inView) return;
+      seen.add(el);
+      if (el.closest('#wdaf-host') || !isVisible(el) || el.matches('input:not([type="button"]):not([type="submit"]), select, textarea, [role="radio"], [role="checkbox"], [role="option"], [role="combobox"], [role="listbox"]')) return;
+      const full = textOf(el);
+      if (full.length > 300) return; // 整块区域（带 tabindex 的大容器）不算
+      const text = cleanLabel(buttonText(el) || full).replace(/\s+/g, ' ').slice(0, 80);
+      const label = (el.getAttribute('aria-label') || el.getAttribute('title') || '').slice(0, 60);
+      if (!text && !label) return;
+      const state = ['expanded', 'selected', 'pressed'].filter((a) => el.getAttribute('aria-' + a) === 'true').concat(el.disabled || el.getAttribute('aria-disabled') === 'true' ? ['disabled'] : []).join(',');
+      items.push({ el, d: { i: items.length, tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', text, label, state, inView: view, y: Math.round(r.top) } });
+    };
+    const all = qa(ADV_SEL);
+    for (const el of all) add(el, true); // 先列视口里的（截图里看得到），再列其他的
+    for (const el of all) add(el, false);
+    return items;
+  }
+  async function aiAdvancePage(why, errs, force) {
+    if (S.settings.useAI === false || S.settings.aiOperator === false || !alive()) return false;
+    const key = location.href.split('#')[0] + '|' + why;
+    const tried = advTried.get(key) || 0;
+    if (tried >= 2) return false;
+    advTried.set(key, tried + 1);
+    errs = (errs && errs.length ? errs : pageErrors()).slice(0, 6);
+    const label = why === 'no-next' ? '没找到下一步' : why === 'stuck' ? '下一步没过' : '提交没过';
+    if (why !== 'no-next') {
+      const errText = norm(errs.join(' '));
+      const bad = collectFields().filter((f) => f.question && !f.datePart && !CRED_RE.test(norm(f.question)) && !isOtherPersonField(f)
+        && ((f.els || [f.el]).some((e) => e.getAttribute('aria-invalid') === 'true' || fieldErrText(e).trim()) || (isEmpty(f) && errText && norm(f.question).length > 6 && errText.includes(norm(f.question).slice(0, 40)))));
+      let fixed = 0;
+      for (const f of bad.slice(0, 3)) {
+        if (!running || !alive()) break;
+        setStatus(`🤖 ${label}，AI 操作员重填「${f.question.slice(0, 30)}」…`);
+        const a = (f.block === 'employer' ? workAnswer(f) : null) || resolveField(f);
+        const wanted = a && a.value && !Array.isArray(a.value) && a.value !== 'CHECK' ? String(a.value) : null;
+        const res = await opWithAI(f, wanted);
+        dbg('AI 兜底：重填', f.question, '→', res.ok, res.note);
+        if (res.ok) fixed++;
+      }
+      if (fixed) { logAI(`🤖 ${label}：AI 操作员重填了 ${fixed} 栏，再试一次`); return true; }
+    }
+    const info = await getJobInfo();
+    const history = [];
+    const sig0 = pageSig();
+    const path0 = location.pathname;
+    const allowApply = why === 'no-next' && !looksLikeRealApplication(); // 职位页（还没进申请表）：允许点 Apply 进申请表
+    for (let n = 0; n < 4 && (running || force) && alive(); n++) {
+      const snap = advSnapshot();
+      if (!snap.length) break;
+      setStatus(`🤖 ${label}，AI 看整页找办法（第 ${n + 1} 步，每步十秒左右）…`);
+      const shotBox = { getBoundingClientRect: () => ({ left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth, height: window.innerHeight }) };
+      const last = history[history.length - 1];
+      const image = n === 0 || (last && !last.changes.length) ? await opScreenshot(shotBox, snap.filter((x) => x.d.inView)) : '';
+      const scope = formScope() || document.body;
+      const res = await askAI({
+        action: 'advance', why, errors: errs, image, elements: snap.map((x) => x.d), history,
+        context: { title: document.title.slice(0, 120), heading: cleanLabel(textOf(q('h1') || q('h2') || scope)).slice(0, 120), hasForm: looksLikeRealApplication(), pageText: cleanLabel(textOf(scope)).replace(/\s+/g, ' ').slice(0, 2500) },
+        job: { title: info.title || jobTitleFromPage(), company: jobCompany(), url: location.href },
+      }, 120000);
+      if (!res || !res.ok) { dbg('AI 兜底没回应', res && res.error); break; }
+      if (res.giveUp || !res.action) { logAI(`🤖 ${label}：AI 看了整页也没办法${res.reason ? '（' + String(res.reason).slice(0, 80) + '）' : ''}`); break; }
+      const a = res.action;
+      const item = snap[Number(a.target)];
+      const name = item ? cleanLabel(`${item.d.text} ${item.d.label}`) : '';
+      let r;
+      if (!item) r = 'no such element';
+      else if (a.type !== 'click') r = 'blocked: only click is allowed';
+      else if (ADV_DANGER_RE.test(name) || (SUBMIT_RE.test(buttonText(item.el)) && !(allowApply && /apply/i.test(name)))) r = 'blocked: not allowed (' + name.slice(0, 30) + ')';
+      else if (item.d.state.includes('disabled')) r = 'blocked: disabled';
+      if (r) { history.push({ action: a, on: name, result: r, changes: [] }); dbg('AI 兜底', r, res.reason); continue; }
+      const advState = () => [textOf(document.body).length, qa('button, a, [role="button"], input, select, textarea').filter(isVisible).length, item.el.getAttribute('aria-expanded') || ''].join('|');
+      const st0 = advState();
+      const href = item.el.tagName === 'A' && item.el.getAttribute('href');
+      if (href && !/^(#|javascript:|mailto:|tel:)/i.test(href) && !item.el.getAttribute('role')) {
+        history.push({ action: a, on: name, result: 'ok', changes: ['(navigating to the link)'] });
+        logAI(`🤖 ${label}：AI 选了链接「${name.slice(0, 30)}」，本页打开`);
+        if (QUEUE) await qSend({ state: 'hop' });
+        location.assign(item.el.href);
+        await sleep(3000);
+        return true;
+      }
+      const stop = opWatch();
+      item.el.scrollIntoView?.({ block: 'center' });
+      await sleep(200);
+      mouseClick(item.el);
+      await sleep(1000);
+      let changes = stop();
+      let changed = changes.length > 0 || advState() !== st0 || pageSig() !== sig0;
+      if (!changed) { // 合成点击没反应：真实鼠标再点一次（有反应就不再点）
+        const stop2 = opWatch();
+        if (await trustedClick(item.el)) { await sleep(1000); changes = stop2(); changed = changes.length > 0 || advState() !== st0 || pageSig() !== sig0; }
+      }
+      if (changed && !changes.length) changes = ['(page changed: visible content / controls differ)'];
+      history.push({ action: a, on: name, result: 'ok', changes });
+      dbg('AI 兜底：点', name, '| 变化', changes, '|', res.reason);
+      await sleep(800);
+      const moved = location.pathname !== path0 || pageSig() !== sig0 || (why === 'no-next' ? !!(findNextButton() || findSubmitButton()) : changed);
+      if (moved) {
+        logAI(`🤖 ${label}：AI 点了「${name.slice(0, 30)}」，页面有变化，接着跑`);
+        return true;
+      }
+    }
+    return false;
+  }
+
 
   function askAI(payload, timeout = 240000) {
     return new Promise((resolve) => {
@@ -3260,7 +3674,9 @@
       try {
         chrome.runtime.sendMessage({ type: 'ai', payload, timeout }, (r) => {
           clearTimeout(t);
-          resolve(r || { ok: false, error: chrome.runtime.lastError?.message || '没有回应' });
+          const rr = r || { ok: false, error: chrome.runtime.lastError?.message || '没有回应' };
+          if (!rr.ok && /疑似在循环/.test(String(rr.error || ''))) { setStatus('⛔ ' + rr.error); if (QUEUE) qOut('stuck', String(rr.error).slice(0, 120)); stopRun(); }
+          resolve(rr);
         });
       } catch (e) {
         clearTimeout(t);
@@ -3351,14 +3767,16 @@
     }
   }
 
-  async function aiAnswerMissing(fields) {
+  const mustTried = new Set();
+  async function aiAnswerMissing(fields, must) {
     if (S.settings.useAI === false) return 0;
+    const tried = must ? mustTried : aiTried;
     const todo = fields.filter((f) => AI_KINDS.has(f.kind) && f.question && !f.datePart && !CRED_RE.test(norm(f.question))
-      && f.block !== 'employer' && f.block !== 'reference' && !aiTried.has(f.kind + '|' + f.question));
+      && f.block !== 'employer' && f.block !== 'reference' && !tried.has(f.kind + '|' + f.question) && !(must && (isKnockout(f.question) || isOtherPersonField(f))));
     if (!todo.length) return 0;
     const qs = [];
     for (const f of todo) {
-      aiTried.add(f.kind + '|' + f.question);
+      tried.add(f.kind + '|' + f.question);
       const options = f.kind === 'text' ? [] : await aiOptions(f);
       const complete = f.kind !== 'prompt' && !(f.kind === 'combo' && options.length >= 90);
       const multi = f.kind === 'checkgroup' || (f.kind === 'combo' && isMultiCombo(f.el)); // 多选题：Codex 可以答好几个，用 || 隔开
@@ -3369,6 +3787,7 @@
     const info = await getJobInfo();
     const res = await askAI({
       action: 'answer',
+      mustAnswer: !!must,
       questions: qs.map(({ f, ...x }) => x),
       profile: S.profile,
       confirmed: confirmedText(),
@@ -3393,7 +3812,7 @@
       n++;
       if (it.f.kind === 'text' && it.f.el.isConnected && it.f.el.value.length < String(a.answer).length - 2) logAI(`⚠ 答案超出网页字数上限被截断：${it.question.slice(0, 40)}，请检查`);
       logAI(`${it.question.slice(0, 48)} → ${a.answer.replace(/\s+/g, ' ').slice(0, 48)}${a.answer.length > 48 ? '…' : ''}`);
-      if (it.type !== 'essay' && learnable(it.f)) {
+      if (!must && it.type !== 'essay' && learnable(it.f)) { // 第二轮的保守答案不进题库
         const ans = fieldAnswer(it.f).replace(/\s+/g, ' ').replace(/=>/g, ' ').trim();
         if (ans) learned.push({ key: norm(it.question).replace(/\|/g, ' ').replace(/=>/g, ' ').trim(), answer: ans });
       }
@@ -3412,7 +3831,14 @@
       const t0 = fileCtxOwn(i);
       const t = CL_RE.test(t0) ? t0 : norm(cleanLabel(precedingText(fileZone(i))) + ' ' + t0);
       const own = norm([i.id, i.name, i.getAttribute('aria-label'), ...String(i.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => textOf(document.getElementById(id))), ...[...(i.labels || [])].map(textOf)].join(' '));
-      const byLabel = CL_RE.test(own) && !/resume|\bcv\b|transcript/.test(own.replace(CL_RE, ' '));
+      let byLabel = CL_RE.test(own) && !/resume|\bcv\b|transcript/.test(own.replace(CL_RE, ' '));
+      if (!byLabel) {
+        let before = '';
+        try { const z = fileZone(i); const r = document.createRange(); r.setStart(z, 0); r.setEndBefore(i); before = norm(r.toString()); } catch (_) { /* ignore */ }
+        const lastOf = (re) => { let k = -1; for (const m of before.matchAll(new RegExp(re.source, 'gi'))) k = m.index; return k; };
+        const cl = lastOf(CL_RE);
+        if (cl >= 0 && cl > lastOf(/resume|\bcv\b|transcript/)) byLabel = true;
+      }
       if (!byLabel && (!CL_RE.test(t) || /resume|\bcv\b|transcript/.test(t.replace(CL_RE, ' ')))) return false;
       if ((i.files && i.files.length) || uploadedInputs.has(i)) return false;
       const zone = textOf(fileZone(i));
@@ -3850,14 +4276,17 @@
 
   function phoneCountryAnswer(f) {
     if (f.kind !== 'popcombo' && f.kind !== 'select' && f.kind !== 'combo') return null;
-    const box = f.el.closest('[class*="phone-country" i], [data-dropdown-id*="country_code" i], [class*="country-code" i]');
+    const box = f.el.closest('[class*="phone-country" i], [data-dropdown-id*="country_code" i], [class*="country-code" i]')
+      || (/country (phone|dialing|dial) ?code|phone country|dialing ?code/i.test(f.question || '') || /dialing ?code|phone.?country.?code/i.test(f.el.id || '') ? f.el : null);
     if (!box || !/united states/i.test(S.profile.country || 'United States')) return null;
-    return { key: 'phoneCountry', value: 'United States (+1)', alts: ['United States (+1)', 'United States of America (+1)', 'United States', 'USA (+1)', 'US (+1)'] };
+    return { key: 'phoneCountry', value: 'United States (+1)', alts: ['United States (+1)', 'United States of America (+1)', 'United States', 'USA (+1)', 'US (+1)', '+1'] };
   }
   async function aiReviewPage() {
     if (S.settings.useAI === false || S.settings.aiReview === false) return 0;
     const all = collectFields().filter((f) => f.question && !CRED_RE.test(norm(f.question)) && !(f.el.type === 'password') && f.el.isConnected);
     if (!all.length) return 0;
+    const BASIC_Q_RE = /\b(legal |preferred )?(first|last|middle|full|given|family|sur)?\s?name\b|e-?mail|phone|mobile|\bcell\b|text (message|communication)|\bsms\b|country|address|\bcity\b|\bstate\b|province|zip|postal/i;
+    if (all.length <= 10 && all.every((f) => BASIC_Q_RE.test(f.question))) { dbg('只有基本资料题，不复核'); return 0; }
     const section = (f) => {
       const parts = [];
       const h = precedingHeading(f.el);
@@ -3871,10 +4300,11 @@
       if (f.block === 'employer' && f.empIdx != null) parts.push(`work history #${f.empIdx + 1}`);
       return parts.join(' > ');
     };
-    const valueOf = (f) => (isEmpty(f) ? '' : f.kind === 'text' ? String(f.el.value || '').trim().slice(0, f.el.tagName === 'TEXTAREA' ? 1500 : 300) : String(fieldAnswer(f) || (f.kind === 'popcombo' ? popText(f.el) : '')).slice(0, 200));
+    const valueOf = (f) => (isEmpty(f) ? '' : f.kind === 'text' && tagChips(f.el).length ? tagChips(f.el).map(chipText).join(', ').slice(0, 300) : f.kind === 'text' ? String(f.el.value || '').trim().slice(0, f.el.tagName === 'TEXTAREA' ? 1500 : 300) : String(fieldAnswer(f) || (f.kind === 'popcombo' ? popText(f.el) : '')).slice(0, 200));
     const optionsOf = (f) => {
       if (f.kind === 'select') return [...f.el.options].filter((o) => o.value !== '' && !isPlaceholderOpt(o)).map((o) => o.text.trim()).filter(Boolean).slice(0, 80);
       if (f.kind === 'radio' || f.kind === 'checkgroup') return f.els.map(choiceLabel).filter(Boolean).slice(0, 40);
+      if (f.kind === 'ui5sel') return ui5Options(f.el).map((o) => o.text).filter(Boolean).slice(0, 80);
       return undefined;
     };
     const list = all.slice(0, 90).map((f, i) => ({
@@ -3884,6 +4314,10 @@
     const sig = location.href.split('#')[0] + '|' + list.map((x) => x.question + '=' + x.value).join('|');
     if (reviewedSigs.has(sig) && !lastPageErrors.length) return 0;
     reviewedSigs.add(sig);
+    const rkey = pageSig();
+    const runs = (reviewRuns.get(rkey) || 0) + 1;
+    reviewRuns.set(rkey, runs);
+    if (runs > 3) { dbg('本页已复核 3 次，不再复核'); return 0; }
     setStatus(`🔎 Codex 正在复核整页（${list.length} 题，半分钟左右）…`);
     const info = await getJobInfo();
     const res = await askAI({
@@ -3892,17 +4326,32 @@
       job: { title: info.title || jobTitleFromPage(), company: jobCompany(), url: location.href },
     }, 240000);
     if (!res || !res.ok) { dbg('复核没成', res && res.error); return 0; }
+    const fixSig = rkey + '|' + JSON.stringify((res.fixes || []).map((x) => [x.id, x.value || '']));
+    if ((res.fixes || []).length && fixSig === lastReviewSig) {
+      setStatus('⛔ 复核在循环（同样的改动又出现一次），这页已停，请你看一下');
+      logAI('⛔ 复核循环：同样的改动重复出现，停下这页');
+      if (QUEUE) qOut('stuck', '复核循环（同样的改动重复出现），已停');
+      stopRun();
+      return 0;
+    }
+    lastReviewSig = fixSig;
     let n = 0;
     for (const fx of res.fixes || []) {
       const f = all[Number(fx.id)];
       if (!f || !f.el.isConnected) continue;
       if (knockoutVeto(f.question, fx.value)) { logAI(`🛡 拦下复核：没把资格题改成「${fx.value || '空'}」：${f.question.slice(0, 40)}`); dbg('复核要把资格题改成否定，拦下', f.question, fx); continue; }
+      if (/preferred (first |last |given |family )?name|nickname/i.test(f.question)) { dbg('复核不改常用名栏', f.question, fx.value); continue; }
+      if (!fx.value && (isRequired(f) || f.el.closest('.form-error, [aria-invalid="true"]') || f.el.getAttribute('aria-invalid') === 'true')) { dbg('复核要清空必填栏，拦下', f.question); continue; }
+      if (!fx.value && (f.el.required || f.el.getAttribute('aria-required') === 'true' || /RequiredField/.test(String(f.el.className || '')) || (/school|university|college/i.test(f.question) && /if not (on|in) (the )?(presented |above |drop-?down )?list|not listed/i.test(f.question) && norm(f.el.value) === norm(S.profile.school)))) { dbg('复核要清空网站必填 / 学校补充栏，拦下', f.question); continue; }
       let ok = false;
       try {
         if (!fx.value) {
-          if (f.kind === 'text') { setText(f.el, ''); ok = true; }
+          reviewCleared.add(norm(f.question));
+          if (f.ui5 && f.kind === 'text') ok = await fillUi5Text(f, '');
+          else if (f.kind === 'text') { setText(f.el, ''); ok = true; }
           else if (f.kind === 'select') { const ph = [...f.el.options].find((o) => o.value === '' || isPlaceholderOpt(o)); if (ph) { setNative(f.el, ph.value); ok = true; } }
-        } else if (f.kind === 'text') { setText(f.el, fx.value); ok = true; }
+        } else if (f.kind === 'text' && f.el.closest(TAG_BOX)) ok = (await addTags(f.el, fx.value)) > 0;
+        else if (f.kind === 'text' && !f.ui5) { setText(f.el, fx.value); ok = true; }
         else ok = !!(await fillField(f, { key: 'AI', value: fx.value, alts: [fx.value] }));
       } catch (e) { dbg('复核改不上', f.question, e); }
       dbg('复核', f.question, '=>', fx.value || '(清空)', '|', fx.reason, '|', ok);
@@ -3914,10 +4363,38 @@
     return n;
   }
   const reviewedSigs = new Set();
+  const reviewCleared = new Set();
+  const reviewRuns = new Map(); // 页面签名 → 复核过几次（同一页最多 3 次）
+  let lastReviewSig = ''; // 上一次复核的「页面 + 改动清单」：一模一样再出现一次就是循环，停
 
   const NEVER_NEEDED_RE = /^address (line )?[34]\b/;
   const mustWriteCL = (f) => f.kind === 'text' && f.el.tagName === 'TEXTAREA' && /cover letter/i.test(f.question) && /\brequires? (a )?cover letter|cover letter is required/i.test(f.question);
-  const stillNeeded = (f) => (isRequired(f) || mustWriteCL(f)) && isEmpty(f) && !NEVER_NEEDED_RE.test(norm(f.question));
+  const CURRENT_JOB_CB_RE = /\b(i )?(currently|presently|still) (work|working|employed) (here|there)\b|current (job|employer|position|role)$/;
+  const REF_ADDR_Q = /address|street|city|county|zip|postal|state|province|country/;
+  const refAddrMissing = (missing) => (missing || []).some((f) => f && f.el && (f.block === 'reference' || /(^|[^p])references?\b|(^|[^p])reference[-_.]/i.test(`${f.el.id || ''} ${f.el.name || ''}`)) && REF_ADDR_Q.test(norm(f.question || '')));
+  const UG_YEAR_OPT = /^(freshman|first[- ]year|sophomore|second[- ]year|junior|third[- ]year|senior|fourth[- ]year|fifth[- ]year|rising (sophomore|junior|senior)|(undergraduate|undergrad)( student)?)$/i;
+  const undergradOnlyQ = (missing) => !/bachelor|undergrad|associate/i.test(S.profile.degree || '') && (missing || []).some((f) => {
+    if (!f || !f.el || !/classification|class standing|year in (school|college)|academic (year|standing|level|classification)|grade level|class year|school year/.test(norm(f.question || ''))) return false;
+    const opts = (f.kind === 'select' ? [...f.el.options].map((o) => o.text) : (f.els || []).map(choiceLabel)).map((t) => String(t || '').trim()).filter((t) => t && !PLACEHOLDER_OPT_RE.test(t));
+    return opts.length >= 2 && opts.every((t) => UG_YEAR_OPT.test(t));
+  });
+  const skipUndergrad = (why = '年级题只有本科年级') => { setStatus(`⛔ 这个岗只招本科生（${why}），你在读硕士，不投。`); qOut('ineligible', '只招本科生：' + why); };
+  const UG_JD_RE = /\bcurrently (a|an|enrolled as an?) (rising )?(sophomore|junior|senior)s?( (or|and|\/) (rising )?(sophomore|junior|senior)s?)? (in|at) (college|university|an? (accredited )?(college|university))|\b(entering|in) (their|your|the) (final|senior|junior|last) year of (undergraduate|undergrad|college|a bachelor)/i;
+  const GRAD_OK_RE = /\bmaster'?s\b|\bm\.?b\.?a\b|\bph\.? ?d\b|\bgrad(uate)? (students?|degrees?|programs?|school|level|candidates?)\b/i;
+  const undergradOnlyJD = () => {
+    if (/bachelor|undergrad|associate/i.test(S.profile.degree || '')) return false;
+    const t = textOf(document.body).slice(0, 80000);
+    return UG_JD_RE.test(t) && !GRAD_OK_RE.test(t.replace(/\bunder ?graduate/gi, ''));
+  };
+  const foreignPhoneMasked = () => collectFields().some((f) => {
+    if (f.kind !== 'text' || !/phone/i.test(f.question) || !(f.block === 'employer' || /employer|company|supervisor/i.test(f.question + ' ' + (f.el.id || '')))) return false;
+    const ph = String(((Array.isArray(S.profile.workHistory) ? S.profile.workHistory : [])[f.empIdx || 0] || {}).phone || '').trim();
+    const v = String(f.el.value || '').trim();
+    return /^\+(?!1\b)/.test(ph) && /^\(\d{3}\) ?\d{3}-\d{4}$/.test(v) && v.replace(/\D/g, '') !== ph.replace(/\D/g, '');
+  });
+  const skipForeignPhone = () => { setStatus('⛔ 雇主电话栏只收美国格式，填不了 EY 的中国号码，按你的意思跳过。'); qOut('skipped', '雇主电话只收美国格式，填不了 EY 中国号码（按你的意思直接跳过）'); };
+  const skipRefAddr = () => { setStatus('⛔ 这份要填推荐人的地址，按你的意思不投，跳过。'); qOut('skipped', '要推荐人地址（按你的意思直接跳过）'); };
+  const stillNeeded = (f) => (isRequired(f) || mustWriteCL(f)) && isEmpty(f) && !NEVER_NEEDED_RE.test(norm(f.question)) && !(f.kind === 'checkbox' && CURRENT_JOB_CB_RE.test(norm(f.question)));
   function isTalentSignupPage() {
     if (/\/closedjob\b/i.test(location.pathname)) return true;
     const h = qa('h1, h2').find((e) => isVisible(e) && !e.closest('#wdaf-host'));
@@ -3999,6 +4476,47 @@
       await sleep(800);
       const dlg = qa('[role="dialog"], [role="alertdialog"], .modal').find(isVisible); // 只在弹出确认框时点「Yes / Delete」，别点到页面上别的按钮
       const yes = dlg && qa('button', dlg).find((x) => isVisible(x) && /^(yes|delete|confirm|ok)$/i.test(textOf(x)));
+      if (yes) { mouseClick(yes); await sleep(600); }
+      n++;
+    }
+    return n;
+  }
+
+  async function icimsTrimEducation() {
+    let n = 0;
+    for (let guard = 0; guard < 8; guard++) {
+      const dels = qa('a, button').filter((x) => /^delete education \((\d+)\)$/i.test(cleanLabel(x.getAttribute('title') || x.getAttribute('aria-label') || textOf(x))) && !x.closest('#wdaf-host'));
+      const idx = (x) => Number((cleanLabel(x.getAttribute('title') || x.getAttribute('aria-label') || textOf(x)).match(/\((\d+)\)/) || [])[1] || 0);
+      const del = dels.filter((x) => idx(x) >= 2).sort((a, b) => idx(b) - idx(a))[0];
+      if (!del) break;
+      dbg('iCIMS 删多余学历', idx(del));
+      mouseClick(del);
+      n++;
+      await sleep(900);
+      const ok = qa('button, a, input[type="button"]').find((b) => isVisible(b) && /^(ok|yes|delete|confirm|remove)$/i.test(buttonText(b)) && b.closest('[role="dialog"], .ui-dialog, .modal'));
+      if (ok) { mouseClick(ok); await sleep(700); }
+    }
+    if (n) logAI(`🧹 删掉读简历多出来的 ${n} 段学历（只留 NYU）`);
+    return n;
+  }
+  async function phenomTrimEducation() {
+    const school = norm(S.profile.school || '');
+    if (!school) return 0;
+    let n = 0;
+    for (let guard = 0; guard < 6; guard++) {
+      const names = qa('input[id^="educationData["][id$="].schoolName"], input[name^="educationData["][name$="].schoolName"]').filter(isVisible);
+      if (names.length <= 1) break;
+      const other = names.find((i) => norm(i.value) && !norm(i.value).includes(school) && !school.includes(norm(i.value)));
+      if (!other) break;
+      let b = other;
+      for (let k = 0; k < 10 && b && !qa('button, [role="button"]', b).some((x) => /remove education|delete education/i.test(x.getAttribute('aria-label') || textOf(x))); k++) b = b.parentElement;
+      const del = b && qa('button, [role="button"]', b).find((x) => /remove education|delete education/i.test(x.getAttribute('aria-label') || textOf(x)));
+      if (!del || qa('input[id$="].schoolName"], input[name$="].schoolName"]', b).length > 1) break;
+      dbg('Phenom 删教育', other.value);
+      mouseClick(del);
+      await sleep(800);
+      const dlg = qa('[role="dialog"], [role="alertdialog"], .modal').find(isVisible);
+      const yes = dlg && qa('button', dlg).find((x) => isVisible(x) && /^(yes|delete|remove|confirm|ok)$/i.test(textOf(x)));
       if (yes) { mouseClick(yes); await sleep(600); }
       n++;
     }
@@ -4169,13 +4687,21 @@
   async function fillPage() {
     await loadState();
     clearHighlights();
+    const otpFields = mailOtpFields();
+    if (otpFields.length) {
+      if (!S.mailbox?.enabled) setStatus('📧 邮箱自动取码尚未连接，请在设置里连接 Outlook，或手动输入验证码。');
+      else if (otpFields.some((el) => el.value)) setStatus('验证码栏已有内容，请检查后点网站的「验证 / 继续」。');
+      await fillMailboxCode();
+      return { filled: 0, missing: otpFields.filter((el) => !el.value).map((el) => ({ el, kind: 'text', question: 'Email verification code' })), mailOtp: true };
+    }
     if (pageTranslated()) throw new Error('这页被浏览器翻译成中文了，插件只认英文原文。请点地址栏右边的翻译图标，选「英语」显示原文，再点一次「填写本页」或「自动到…」。');
     if (WD_HOST && (WD_LOCALE && !/^en-/.test(WD_LOCALE[1]) || /^(zh|ja|ko|fr|de|es|pt|it)\b/i.test(document.documentElement.lang || ''))) {
       throw new Error('这是 Workday 的' + (WD_LOCALE ? WD_LOCALE[1] : document.documentElement.lang) + ' 语言版页面，插件只认英文。请把网址里的语言段改成 en-US，或在页面最底下的语言选择里换成 English，再点一次「填写本页」。');
     }
     if (isSignInPage()) {
-      setStatus('这是登录 / 创建账号页，请自己登录（插件不处理密码）。');
-      return { filled: 0, missing: [] };
+      const reg = fillRegistration();
+      setStatus(reg ? registrationStatus(reg) : '这是登录页，请用该网站已有的账号登录。');
+      return { filled: reg ? reg.filled : 0, missing: [], registration: reg };
     }
     if (isTalentSignupPage()) throw new Error('这个职位已关闭，页面是「Let\'s connect / 加入人才库」登记表，不是申请。插件不填（不加入人才库）。');
     await leverLocation();
@@ -4188,11 +4714,22 @@
       setStatus(`🧠 已记住你答的 ${learned} 道题，以后遇到会自动答`);
       await sleep(1200);
     }
-    let filled = 0;
-    if (await uploadResume()) filled++;
+    const registration = fillRegistration();
+    let filled = registration ? registration.filled : 0;
+    if (await uploadResume()) { filled++; if (isSfXweb()) filled += await sfResumeDialog(6000); else filled += await resumeReplaceDialog(4000); }
+    if (isSfXweb()) filled += await sfResumeDialog(0);
+    filled += await resumeReplaceDialog(0);
+    filled += await paycomSignature();
+    filled += await paycomRefOptIn();
     if (await uploadTranscript()) filled++;
     if (!isWD()) filled += await addEmploymentBlocks();
     filled += await paylocityTrimEducation();
+    filled += await phenomTrimEducation();
+    filled += await icimsTrimEducation();
+    filled += expandCollapsed();
+    filled += await tidyTags();
+    filled += await viewpointInitials();
+    filled += await checkRequiredMarketing();
     if (isWD() && /experience/i.test(currentStep())) filled += await fillExperienceSections();
 
     const attempts = new Map(); // 每个字段最多试 2 次，避免死循环
@@ -4202,16 +4739,17 @@
       const all = collectFields();
       for (const f of all) if (f.kind === 'text' && /\bmi\b|middle (name|initial)/i.test(f.question) && norm(f.el.value) === norm(valueFor('FULLNAME'))) setText(f.el, '');
       const fields = all
-        .map((f) => ({ ...f, ans: oracleItemAnswer(f) || pinpointEduAnswer(f) || pinpointWorkDate(f) || phoneCountryAnswer(f) || languageAnswer(f, all) || otherFollowAnswer(f) || (f.block === 'employer' ? workAnswer(f) : null) || refAnswer(f) || dateAnswer(f) || naAnswer(f) || workAnswer(f) || textDateAnswer(f) || ackAnswer(f) || (f.datePart ? null : resolveField(f) || agreeAnswer(f)) }))
+        .map((f) => ({ ...f, ans: oracleItemAnswer(f) || refGuard(f) || salaryIdAnswer(f) || pinpointEduAnswer(f) || stillStudentBox(f) || pinpointWorkDate(f) || phoneCountryAnswer(f) || languageAnswer(f, all) || otherFollowAnswer(f) || (f.block === 'employer' ? workAnswer(f) : null) || refAnswer(f) || dateAnswer(f) || naAnswer(f) || workAnswer(f) || textDateAnswer(f) || ackAnswer(f) || (f.datePart ? null : resolveField(f) || agreeAnswer(f)) }))
         .filter((f) => !(f.ans && EDU_KEYS.has(f.ans.key) && foreignEduBlock(f.el)))
         .filter((f) => f.ans && f.ans.value && (isEmpty(f) || S.settings.overwrite || (f.ans.key === 'phone' && /\D/.test(f.el.value) && (isWD() || f.el.value.replace(/\D/g, '').slice(-10) !== String(f.ans.value).replace(/\D/g, '').slice(-10)))
-          || (ADDRESS_KEYS.has(f.ans.key) && S.profile.address1) || (f.ans.empAddr && f.block === 'employer') || f.ans.key === 'phoneCountry' || (VISA_KEYS.has(f.ans.key) && CHOICE_KINDS.has(f.kind))) && !alreadyMatches(f, f.ans))
+          || (ADDRESS_KEYS.has(f.ans.key) && S.profile.address1) || (f.ans.empAddr && f.block === 'employer') || f.ans.key === 'phoneCountry' || wrongPrefilledDegree(f) || (VISA_KEYS.has(f.ans.key) && CHOICE_KINDS.has(f.kind))) && !alreadyMatches(f, f.ans))
         .sort((a, b) => Number(b.ans.first) - Number(a.ans.first)); // 先填 Country：改了会刷新地址栏
       dbg(`第 ${pass + 1} 轮：认出 ${all.length} 题，要填 ${fields.length} 题\n认出：` + all.map((f) => `${f.kind}:${f.question.slice(0, 28)}`).join(' | ')
         + '\n要填：' + fields.map((f) => `${f.question.slice(0, 28)} => ${String(f.ans.value).slice(0, 25)}`).join(' | '));
       for (const f of fields) {
         if (!running) break;
         if (!f.el.isConnected) continue;
+        if (reviewCleared.has(norm(f.question)) && !isRequired(f) && f.ans.key !== 'AI') { dbg('复核清空过的栏，不再填回', f.question); continue; }
         const id = f.kind + '|' + f.question + '|' + (f.datePart || '') + '|' + f.occ;
         const n = attempts.get(id) || 0;
         if (n >= 2) continue;
@@ -4362,6 +4900,25 @@
     lastPageErrors = pageErrors();
     const bad = collectFields().filter((f) => (f.els || [f.el]).some((e) => e.getAttribute('aria-invalid') === 'true') || stillNeeded(f));
     for (const f of bad) { aiTried.delete(f.kind + '|' + f.question); opTried.delete(location.href + '|' + recipeKey(f)); }
+    for (const sel of qa('select').filter((e) => isVisible(e) && e.value && !e.closest('#wdaf-host') && fieldErrText(e).trim())) {
+      const v = sel.value;
+      const ph = [...sel.options].find((o) => o.value === '' || isPlaceholderOpt(o));
+      if (ph) { setNative(sel, ph.value); await sleep(150); }
+      setNative(sel, v);
+      sel.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+      dbg('自修：下拉重选一次', sel.id || sel.name, v);
+    }
+    for (const el of qa('input[placeholder]').filter((e) => /mm\s*\/\s*dd/i.test(e.placeholder) && e.value && isVisible(e) && (e.closest('[aria-invalid="true"], .form-error') || fieldErrText(e).trim()))) await fillFocusDate(el, el.value);
+    for (const el of qa('input, textarea').filter((e) => e.getAttribute('aria-invalid') === 'true' || fieldErrText(e).trim())) {
+      if (el.closest('#wdaf-host') || !isVisible(el) || !el.value || /^(checkbox|radio|file|hidden|password)$/i.test(el.type) || el.getAttribute('role') === 'combobox') continue;
+      let v = el.value;
+      const max = Number((fieldErrText(el).match(/(?:only|maximum of|max(?:imum)?|up to|no more than|exceed) (\d+) characters/i) || [])[1] || 0);
+      if (max && v.length > max) v = v.slice(0, max).replace(/[,;.]?\s+\S*$/, '');
+      setNative(el, '');
+      setNative(el, v);
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+      el.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    }
     reviewedSigs.clear();
     dbg('下一步没过，自修一轮', lastPageErrors, bad.map((f) => f.question));
     setStatus(`下一步没过${lastPageErrors.length ? '（' + lastPageErrors.slice(0, 2).join('；').slice(0, 80) + '）' : ''}，自己修一轮再试…`);
@@ -4385,9 +4942,11 @@
   }
 
   const buttonText = (b) => cleanLabel(textOf(b) || b.value || b.getAttribute('aria-label') || '');
-  const pageButtons = () => qa('button, input[type="submit"], input[type="button"], a[role="button"], [role="button"], a.btn' + (isSR() ? ', spl-button' : ''), formScope())
-    .filter((b) => isVisible(b) && !b.closest('#wdaf-host') && !b.disabled);
-  const NEXT_RE = /^(save (and|&) continue|save (and|&) next|skip (and|&) continue|next|next step|next section|next page|continue|continue to next (step|section|page)|proceed|下一步|下一页|继续)( ?[>›→»])?$/i; // Google 表单中文界面是「下一页」
+  const pageButtons = () => (isSfXweb() && ui5All().some((e) => ui5Tag(e) === 'wizard-step')
+    ? ui5All().filter((e) => ui5Tag(e) === 'button')
+    : [...qa('button, input[type="submit"], input[type="button"], a[role="button"], [role="button"], a.btn' + (isSR() ? ', spl-button' : ''), formScope()), ...(isSfXweb() ? ui5All().filter((e) => ui5Tag(e) === 'button') : [])])
+    .filter((b) => isVisible(b) && !b.closest('#wdaf-host') && !b.disabled && !b.hasAttribute('disabled'));
+  const NEXT_RE = /^(save (and|&) continue|save (and|&) next|skip (and|&) continue|next|next step|next section|next page|continue|continue to next (step|section|page)|continue to (the )?(application|apply)|proceed|下一步|下一页|继续)( ?[>›→»])?$/i; // Google 表单中文界面是「下一页」
   const SUBMIT_RE = /^(submit|submit application|submit my application|submit your application|apply|apply now|send application|complete application|finish|finish application|提交|提交申请)$/i;
 
   function findNextButton() {
@@ -4399,6 +4958,62 @@
   function findSubmitButton() {
     return pageButtons().find((b) => SUBMIT_RE.test(buttonText(b)));
   }
+  const stayOnJobButton = () => qa('button, a, [role="button"]').find((b) => isVisible(b) && !b.closest('#wdaf-host') && /^continue with this (job|application|position|role)$/i.test(buttonText(b)));
+
+  const consentGated = new Set();
+  function consentGateButton() {
+    if (!S.settings.acceptTerms || consentGated.has(location.href)) return null;
+    const bs = qa('button, a, [role="button"], input[type="button"], input[type="submit"]').filter((b) => isVisible(b) && !b.closest('#wdaf-host'));
+    const acc = bs.find((b) => /^(i accept|accept|i agree|agree|i consent)$/i.test(buttonText(b)));
+    if (!acc || !bs.some((b) => /^(i decline|decline|i do not (accept|agree)|i disagree)$/i.test(buttonText(b)))) return null;
+    const ctx = textOf(acc.closest('article, main, form, [role="dialog"], section') || document.body).slice(0, 20000);
+    if (/cookie/i.test(textOf(acc.parentElement?.parentElement || acc)) || /marketing|newsletter|talent (community|network|pool)|job alert/i.test(ctx.slice(0, 600))) return null;
+    return /data (consent|privacy|protection)|privacy (notice|policy|statement)|personal (data|information)/i.test(ctx) ? acc : null;
+  }
+
+  const COOKIE_RE = /\bcookies?\b|cookie ?(policy|settings|preferences)/i;
+  const COOKIE_VENDOR_RE = /cookie|onetrust|cookiebot|truste|osano|usercentrics|cc-window|cmp-|consent-banner|gdpr-banner/i;
+  const COOKIE_REJECT_RE = /^(reject|decline|deny|refuse)( all)?( (optional|non-essential|additional))?( cookies)?$|^(use |accept |allow )?(only )?(strictly )?(necessary|essential|required)( cookies)?( only)?$|^do not (accept|allow)( cookies)?$|^(不同意|拒绝)(全部|所有)? ?(cookies?)?$|^仅(限)?(接受)?必要(的)? ?(cookies?)?$|^只接受必要.*$/i;
+  const COOKIE_MANAGE_RE = /^(manage|customi[sz]e|cookie settings|cookies settings|(manage )?(cookie )?preferences|settings|more options|options|管理.{0,6}cookies?|cookies? ?设置|设置)$/i;
+  const COOKIE_SAVE_RE = /^(confirm (my )?choices?|save (my )?(choices?|preferences|settings)|save and (close|exit)|确认(我的)?选择|保存(设置|选择)?)$/i;
+  let cookieManaged = false;
+  let cookieTicks = 0;
+  function cookieBox(b) {
+    for (let p = b.parentElement, i = 0; p && i < 8 && p !== document.body; p = p.parentElement, i++) {
+      const t = textOf(p);
+      if (t.length > 3000) return null;
+      if (!COOKIE_RE.test(t)) continue;
+      const pos = getComputedStyle(p).position;
+      if (pos === 'fixed' || pos === 'sticky' || COOKIE_VENDOR_RE.test(`${p.id} ${typeof p.className === 'string' ? p.className : ''}`)) return p;
+    }
+    return null;
+  }
+  function dismissCookies() {
+    const btns = qa('button, a, [role="button"], input[type="button"], input[type="submit"]').filter((b) => !b.closest('#wdaf-host') && isVisible(b));
+    const inBox = btns.map((b) => ({ b, t: buttonText(b).trim() })).filter((x) => x.t && x.t.length < 60).map((x) => ({ ...x, box: cookieBox(x.b) })).filter((x) => x.box);
+    if (!inBox.length) return false;
+    const rej = inBox.find((x) => COOKIE_REJECT_RE.test(x.t)) || (cookieManaged && inBox.find((x) => COOKIE_SAVE_RE.test(x.t)));
+    if (rej) { mouseClick(rej.b); dbg('cookie 横幅：点了', rej.t); return true; }
+    const man = !cookieManaged && inBox.find((x) => COOKIE_MANAGE_RE.test(x.t));
+    if (man) { cookieManaged = true; mouseClick(man.b); dbg('cookie 横幅：点开设置', man.t); return false; }
+    inBox[0].box.style.setProperty('display', 'none', 'important');
+    dbg('cookie 横幅：没有拒绝按钮，藏起来');
+    return true;
+  }
+  const doneSeen = new Set();
+  if (!IN_FRAME) setInterval(async () => {
+    try {
+      const body = textOf(document.body).slice(0, 20000);
+      const paycomDone = /(^|\.)paycomonline\.(net|com)$/i.test(location.hostname) && /export your application/i.test(body);
+      if (running || doneSeen.has(location.href) || !(Q_DONE_PATH.test(location.pathname) || paycomDone) || !Q_DONE_RE.test(body)) return;
+      doneSeen.add(location.href);
+      await addLog('已提交');
+      setStatus('🎉 已提交（这是提交成功页）');
+      if (QUEUE) qOut('submitted', '提交成功页');
+      else { let last = ''; try { last = sessionStorage.getItem('wdaf-lastJob') || ''; } catch (_) { /* ignore */ } chrome.runtime.sendMessage({ type: 'queueDoneByUrl', url: last || location.href }, () => void chrome.runtime.lastError); }
+    } catch (_) { /* ignore */ }
+  }, 3000);
+  const cookieTimer = setInterval(() => { try { dismissCookies(); } catch (_) { /* ignore */ } if (++cookieTicks >= 40) clearInterval(cookieTimer); }, 1500);
 
   function isMixedSignupPage() {
     if (isWD() || !qa('input[type="password"]').some(isVisible)) return false;
@@ -4408,19 +5023,149 @@
   }
 
   function isSignInPage() {
-    if (!isWD()) return qa('input[type="password"]').some(isVisible) && !isMixedSignupPage(); // 通用网站：只有登录框的页面才算登录 / 注册页
+    if (!isWD()) return qa('input[type="password"]').some(isVisible) && (!isMixedSignupPage() || /\b(sign ?in|log ?in|log ?on)\b/i.test(document.title));
     return isVisible(q('[data-automation-id="signInContent"]')) || /sign in|create account/i.test(currentStep());
+  }
+
+  const registrationPasswords = new WeakSet();
+  function isPasswordInput(el) {
+    if (el.type === 'password') return true;
+    if (/^(email|tel|number|url|search)$/i.test(el.type || '') || /e-?mail|phone|mobile|first.?name|last.?name|user.?name/i.test([el.name, el.id, el.getAttribute('aria-label'), el.placeholder, el.closest('label') && textOf(el.closest('label')), el.labels && [...el.labels].map(textOf).join(' ')].join(' '))) return false;
+    return /(^|\s)(new|current)-password(\s|$)/i.test(el.autocomplete || '') || registrationPasswords.has(el);
+  }
+  function registrationForm() {
+    if (!(QUEUE || isWD() || atsOf() || /career|jobs?|recruit|applicant|candidate|employment/i.test(location.hostname + location.pathname + document.title))) return null;
+    const passwords = qa('input').filter((e) => isPasswordInput(e) && isVisible(e) && !e.disabled && !e.readOnly && !e.closest('#wdaf-host'));
+    for (const password of passwords) {
+      const scope = password.closest('form, [role="dialog"], [data-automation-id="signInContent"]') || document;
+      const inputs = qa('input', scope).filter((e) => isVisible(e) && !e.disabled && !e.readOnly && !e.closest('#wdaf-host'));
+      const pw = inputs.filter(isPasswordInput);
+      const headings = qa('h1, h2, h3, [role="heading"]', scope).filter(isVisible).map(textOf).join(' ');
+      if (/\b(reset|forgot|change|update)[\s_/-]*(?:(your|my|the)[\s_-]*)?password|password[\s_/-]*(reset|change|recovery)/i.test(location.pathname + ' ' + location.hash + ' ' + headings + ' ' + document.title) || pw.some((e) => e.autocomplete === 'current-password')) continue;
+      const signup = /creat(e|ing) (an? |your )?(account|login)|sign[ -]?up|register|registration|注册/i;
+      const submit = qa('button[type="submit"], button:not([type]), input[type="submit"], [data-automation-id="createAccountSubmitButton"]', scope).filter(isVisible);
+      if (pw.length === 1 && !pw.some((e) => e.autocomplete === 'new-password') && (/^\s*(sign[ -]?in|log[ -]?in|welcome back|登录|登入)\b/i.test(headings) || submit.some((e) => /^(sign[ -]?in|log[ -]?in)$/i.test(textOf(e) || e.value)))) continue;
+      if (!(pw.length >= 2 || pw.some((e) => e.autocomplete === 'new-password') || signup.test(headings + ' ' + document.title) || /\/(register|registration|sign[-_]?up|create[-_]?account)(\/|$)/i.test(location.pathname) || submit.some((e) => signup.test(textOf(e) || e.value)))) continue;
+      const accounts = inputs.filter((e) => !isPasswordInput(e) && /^(text|email)$/.test(e.type) && !JOB_ALERT_FIELD_RE.test(e.name + ' ' + e.id) && /e-?mail|user[ _-]?(name|id)|^login\b/i.test([questionFor(e), e.name, e.id, e.autocomplete, e.placeholder].join(' ')));
+      return { passwords: pw, accounts, scope };
+    }
+    return null;
+  }
+  function fillRegistration() {
+    const creds = S.registration || {};
+    if (!creds.email || !creds.password) return null;
+    const form = registrationForm();
+    if (!form) return null;
+    let filled = 0;
+    for (const el of form.passwords) registrationPasswords.add(el);
+    for (const [inputs, value] of [[form.accounts, creds.email], [form.passwords, creds.password]]) {
+      for (const el of inputs) if (!el.value || (value === creds.email && el.value === creds.password)) { setText(el, value); filled++; }
+    }
+    return { filled, complete: form.accounts.length > 0 && form.accounts.every((e) => e.value === creds.email) && form.passwords.every((e) => e.value === creds.password) };
+  }
+  function registrationStatus(reg) {
+    if (registrationAttempted) return '已尝试创建账号；如网站报错，请处理页面提示，注册成功后自动继续申请。';
+    return reg.complete ? '✅ 注册信息已填好，自动流程会创建账号并继续申请。' : '已补填空白注册栏；已有内容保留，请检查账号和两栏密码，注册完成后自动继续。';
+  }
+
+  let registrationAttempted = false;
+  async function submitRegistration(reg) {
+    if (!running || !reg?.complete || registrationAttempted) return false;
+    let form = registrationForm();
+    if (!form || captchaVisible() || mailOtpFields().length) return false;
+    for (const el of qa('input[type="checkbox"], [role="checkbox"]', form.scope)) {
+      if (!isVisible(el) || el.disabled || el.getAttribute('aria-disabled') === 'true' || el.closest('#wdaf-host') || isChecked(el)) continue;
+      const question = [questionFor(el), choiceLabel(el)].join(' ');
+      if (!S.settings.acceptTerms || SUBSCRIBE_RE.test(norm(question)) || /marketing|promotional|\bsms\b|text message|whatsapp|future (job )?(opportunit|openings)/i.test(question)) continue;
+      if (/terms|conditions|privacy|consent|acknowledge|i (?:have )?read|i agree|隐私|条款|同意/i.test(question)) await clickChoiceReal(el);
+      if (!running) return false;
+    }
+    form = registrationForm();
+    if (!form || !form.accounts.length || form.accounts.some((el) => el.value !== S.registration.email) || form.passwords.some((el) => el.value !== S.registration.password)) return false;
+    const invalid = qa('input, select, textarea, [role="checkbox"]', form.scope).some((el) => isVisible(el) && !el.disabled && !el.closest('#wdaf-host')
+      && (el.getAttribute('aria-invalid') === 'true' || (el.validity && !el.validity.valid)
+        || ((el.type === 'checkbox' || el.getAttribute('role') === 'checkbox') && !isChecked(el)
+          && (isRequired({ el, kind: 'checkbox', question: questionFor(el) }) || /terms|conditions|privacy|consent|隐私|条款|同意/i.test(choiceLabel(el))))));
+    const errors = pageErrors();
+    if (invalid || errors.length) {
+      setStatus(errors.length ? `注册页需要处理：${errors.slice(0, 2).join('；')}` : '注册页还有未完成或格式不符的必填项，请检查。注册成功后自动继续。');
+      return false;
+    }
+    const button = qa('button, input[type="submit"], input[type="button"], [role="button"]', form.scope).find((el) => isVisible(el) && !el.closest('#wdaf-host')
+      && (/^(?:create (?:an? |your )?(?:account|login)|sign[ -]?up|register|注册|创建(?:账号|帐户|账户))$/i.test(buttonText(el)) || el.getAttribute('data-automation-id') === 'createAccountSubmitButton'));
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true' || !running) return false;
+    registrationAttempted = true; // 一页只尝试一次，账号已存在、密码被拒等错误不自动连点。
+    sessionStorage.setItem(AUTO_KEY, '1'); // 整页跳转后也接着投当前职位。
+    setStatus('正在创建账号，成功后自动继续申请…');
+    button.click();
+    return true;
+  }
+
+  async function waitForRegistration(done, timeout) {
+    const end = Date.now() + timeout;
+    while (running && alive() && Date.now() < end && !done()) {
+      await submitRegistration(fillRegistration());
+      await sleep(1000);
+    }
+  }
+
+  const mailboxCodeInputs = new WeakSet();
+  function isSensitiveInput(el) {
+    return isPasswordInput(el) || mailboxCodeInputs.has(el) || el.autocomplete === 'one-time-code';
+  }
+  function mailOtpFields() {
+    if (!(QUEUE || isWD() || atsOf() || /career|jobs?|recruit|applicant|candidate|employment/i.test(location.hostname + location.pathname + document.title))) return [];
+    const body = textOf(document.body).slice(0, 30000);
+    if (!/e-?mail|inbox|邮箱|郵箱/i.test(body) || !/verification code|security code|one[- ]time (?:code|passcode)|enter.{0,30}code|验证码|驗證碼/i.test(body)) return [];
+    const fields = qa('input').filter((el) => {
+      if (!isVisible(el) || el.disabled || el.readOnly || el.closest('#wdaf-host') || isPasswordInput(el) || !/^(text|tel|number)$/.test(el.type)) return false;
+      const label = [questionFor(el), el.name, el.id, el.placeholder, el.autocomplete].join(' ');
+      return !/captcha|postal|zip|phone|sms/i.test(label) && (mailboxCodeInputs.has(el) || /one-time-code|\botp\b|verification.?code|security.?code|passcode|code (?:character|digit)/i.test(label) || el.maxLength === 1);
+    });
+    fields.forEach((el) => mailboxCodeInputs.add(el));
+    return fields;
+  }
+  let mailOtpState = null;
+  async function fillMailboxCode() {
+    const fields = mailOtpFields();
+    if (!fields.length || !S.mailbox?.enabled || !S.mailbox.email || fields.some((el) => el.value)) return;
+    if (!(fields.length === 1 || (fields.length >= 4 && fields.length <= 8 && fields.every((el) => el.maxLength === 1)))) return;
+    const sig = location.href + '|' + fields.map((el) => el.name + ':' + el.id).join('|');
+    if (!mailOtpState || mailOtpState.sig !== sig) mailOtpState = { sig, since: Date.now() / 1000 - 60, deadline: Date.now() + 120000, next: 0, busy: false, stopped: false };
+    const state = mailOtpState;
+    if (state.busy || state.stopped || Date.now() < state.next) return;
+    if (Date.now() > state.deadline) { state.stopped = true; setStatus('等待邮箱验证码超时，请手动填入或重新发送。'); return; }
+    const emails = textOf(document.body).slice(0, 30000).match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+    if (emails.length && !emails.some((email) => email.toLowerCase() === S.mailbox.email.toLowerCase())) { state.stopped = true; setStatus('页面收件邮箱与已连接的 Outlook 不一致，请手动核对。'); return; }
+    state.busy = true;
+    state.next = Date.now() + 8000;
+    setStatus('📧 正在等待并匹配当前招聘网站的邮箱验证码…');
+    try {
+      const length = fields.length > 1 ? fields.length : fields[0].maxLength >= 4 && fields[0].maxLength <= 8 ? fields[0].maxLength : 0;
+      const r = await new Promise((resolve) => {
+        try { chrome.runtime.sendMessage({ type: 'mailbox', action: 'mailCode', since: state.since, length }, (x) => resolve(chrome.runtime.lastError ? null : x)); } catch (_) { resolve(null); }
+      });
+      if (!r?.ok) { state.stopped = true; setStatus(r?.error || '邮箱连接不可用，请手动输入验证码。'); return; }
+      if (!r.code) return;
+      const code = String(r.code);
+      if (!/^[A-Z0-9]{4,8}$/i.test(code) || (length && code.length !== length)) { state.stopped = true; return; }
+      if (mailOtpState !== state || fields.some((el) => !el.isConnected || el.value)) return;
+      for (const el of fields) mailboxCodeInputs.add(el);
+      fields.forEach((el, i) => setText(el, fields.length > 1 ? code[i] : code));
+      state.stopped = true;
+      setStatus('✅ 邮箱验证码已自动填入，请检查后点网站的「验证 / 继续」。');
+    } finally { state.busy = false; }
   }
 
   const pageSig = () => isWD()
     ? currentStep() + '|' + location.pathname
     : location.href + '|' + document.title + '|' + collectFields().map((f) => f.question).join('|').slice(0, 800);
 
-  const Q_DONE_RE = /application (has been |was )?(successfully )?(submitted|received|sent)|thank you for (applying|your application|submitting)|thanks for applying|successfully (applied|submitted)|we('ve| have) received your application|your application has been sent|application submitted|application success\b|we('re| are) thrilled that you('re| are) interested|感[谢謝](您)?(的申[请請]|申[请請]|花[时時][间間]申[请請]|投[递遞])|申[请請](已|已[经經])(提交|送出|收到)|已收到[你您]的申[请請]/i; // Greenhouse 按浏览器语言显示确认页（Garda 实测是中文「感謝您花時間申請」）
+  const Q_DONE_RE = /we appreciate your interest(?![^.]{0,80}(unfortunately|however|no longer))|thank you for your interest\.(?!\s*(unfortunately|however|this (job|position|posting|role)|we are no longer|we are (currently )?not accepting))|application (has been |was )?(successfully )?(submitted|received|sent)|thank you for (applying|your application|submitting)|thanks for applying|successfully (applied|submitted)|we('ve| have) received your application|your application has been sent|application submitted|application success\b|we('re| are) thrilled that you('re| are) interested|感[谢謝](您)?(的申[请請]|申[请請]|花[时時][间間]申[请請]|投[递遞])|申[请請](已|已[经經])(提交|送出|收到)|已收到[你您]的申[请請]/i; // Greenhouse 按浏览器语言显示确认页（Garda 实测是中文「感謝您花時間申請」）
   const US_PERSON_RE = /legally requires? .{0,30}u\.?s\.? person|requires? ["“]?u\.?s\.? person["”]? status|must be (a )?u\.?s\.? (citizen|person)\b|(only|exclusively) (open|available) to u\.?s\.? citizens|u\.?s\.? citizenship (is )?(required|mandatory)|requires? u\.?s\.? citizenship|(can |will )?only (hire|employ|consider|accept|sponsor) u\.?s\.? citizens|(open|available) only to u\.?s\.? citizens/i; // Thought Logic 题目「Due to company restrictions, we can only hire U.S. Citizens or those with a valid Green Card」
-  const Q_CLOSED_RE = /(this|the) (job|position|posting|requisition|role|opening)( posting)? (is )?(no longer|not) (available|accepting|open|active)|(job|position|posting|requisition) (has been |is )?(closed|filled|expired|removed)|no longer accepting applications|(is )?not (currently )?accepting (new )?applications|page (you are looking for|you requested|you're looking for) (doesn'?t|does not|could not|cannot|can'?t) (exist|be found)|job not found|(this|the) job (is|has) (closed|expired)|sorry,? (this|the) (job|position|posting) /i;
+  const Q_CLOSED_RE = /(this|the) (job|position|posting|requisition|role|opening)( posting)? (is )?(no longer|not) (available|accepting|open|active)|(job|position) you are (trying|looking) to apply (for|to) has been filled|(job|position|posting|requisition) (has been |is )?(closed|filled|expired|removed)|no longer accepting applications|(is )?not (currently )?accepting (new )?applications|page (you are looking for|you requested|you're looking for) (doesn'?t|does not|could not|cannot|can'?t) (exist|be found)|page (you are|you're) looking for (no longer exists|has been removed)|job not found|(this|the) job (is|has) (closed|expired)|sorry,? (this|the) (job|position|posting) |(currently |are |is )?not (currently )?accepting (any )?(further |more |new |additional )?(applicants|applications)/i; // Scotiabank「We are currently not accepting any further applicants for this role.」
   const Q_DUP_RE = /you('ve| have) already applied|already (applied|submitted an application) (for|to) this|you have previously applied (for|to) this|application already received/i; // Lever：…/already-received「Application already received」（BPM LLP）
-  const Q_APPLY_RE = /^(apply|apply now|apply for (this|the) (job|position|role|opportunity)|apply to (this )?(job|position|role)|apply online|apply here|apply on (the )?company('s)? (site|website)|start (your |my )?application|i'?m interested|submit (an )?application)$/i;
+  const Q_APPLY_RE = /^(apply|apply now|apply for ((this|the|a) )?(job|position|role|opportunity)|apply to (this )?(job|position|role)|apply online|apply here|apply on (the )?company('s)? (site|website)|start (your |my )?application|i'?m interested|submit (an )?application)$/i;
   let qReported = false; // 这一轮自动流程已经回报过结果
   let qLastState = '';
   let qLastProgress = 0;
@@ -4440,7 +5185,7 @@
     dbg('队列回报', state, note);
     QUEUE.status = 'needs';
     QUEUE.need = state;
-    qSend({ state, note: String(note || '').slice(0, 400), missing: (missing || []).map((f) => (typeof f === 'string' ? f : f && f.question) || '') });
+    qSend({ state, note: String(note || '').slice(0, 400), keepOpen: state === 'login' && !!(S.registration?.password && registrationForm()), missing: (missing || []).map((f) => (typeof f === 'string' ? f : f && f.question) || '') });
   }
   function qProgress() {
     if (!QUEUE || Date.now() - qLastProgress < 15000) return;
@@ -4448,7 +5193,7 @@
     if (qLastState === 'login') qLastState = '';
     qSend({ state: 'progress' });
   }
-  const Q_DONE_PATH = /\/(confirmation|thank-?you|thanks|success|submitted|application-?complete)(\/|$)/i;
+  const Q_DONE_PATH = /\/(apply-?)?(confirmation|thank-?you|thanks|success|submitted|application-?complete)(\/|$)|\/jobTasks\/completed\//i; // Workday 交完：/jobTasks/completed/application（弹「Application Submitted」） // Phenom（Freddie Mac）：/us/en/applythankyou
   function qSuccessNow(before, path0) {
     if (path0 && location.pathname !== path0 && Q_DONE_PATH.test(location.pathname)) return true;
     const m = textOf(document.body).slice(0, 30000).match(Q_DONE_RE);
@@ -4495,18 +5240,65 @@
   async function submitSlot() {
     try {
       const r = await chrome.runtime.sendMessage({ type: 'submitSlot', host: location.hostname });
-      if (r && r.wait > 0) { setStatus(`同一网站刚有一份在提交，等 ${Math.ceil(r.wait / 1000)} 秒再交（免得网站撞车报错）…`); await sleep(r.wait); }
+      if (r && r.wait > 0) { setStatus(`同一网站刚有一份在提交，等 ${Math.ceil(r.wait / 1000)} 秒再交（免得同一网站两份撞车）…`); await sleep(r.wait); }
     } catch (_) { /* ignore */ }
   }
+  function looksLikeRealApplication() {
+    if (qa('input[type="file"]').some((i) => !i.closest('#wdaf-host') && !isSubscribeForm(i.closest('form')))) return true;
+    const filled = collectFields().filter((f) => !isSubscribeForm(f.el.closest && f.el.closest('form')) && !isEmpty(f)).length;
+    return filled >= 4;
+  }
+  async function ashbyRecommit() {
+    if (!q('.ashby-application-form-container')) return 0;
+    let n = 0;
+    for (const fe of qa('.ashby-application-form-field-entry').filter(isVisible)) {
+      const yn = q('[class*="_yesno_"]', fe);
+      if (yn) {
+        const bs = qa('button', yn);
+        const on = bs.find((b) => b.getAttribute('aria-pressed') === 'true');
+        const off = bs.find((b) => b !== on);
+        if (on && off) { off.click(); await sleep(200); on.click(); await sleep(200); n++; }
+        continue;
+      }
+      const radios = qa('input[type="radio"]', fe);
+      const r = radios.find((x) => x.checked);
+      const other = r && radios.find((x) => x !== r);
+      if (other) { other.click(); await sleep(150); r.click(); await sleep(150); n++; }
+      for (const c of qa('input[type="checkbox"]', fe).filter((x) => x.checked)) { c.click(); await sleep(120); if (!c.checked) c.click(); await sleep(120); n++; }
+      for (const el of qa('input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input:not([type]), textarea', fe)) {
+        if (!el.value || el.getAttribute('role') === 'combobox' || el.readOnly || !isVisible(el)) continue;
+        const v = el.value;
+        if (el.tagName === 'TEXTAREA') { setText(el, ''); await sleep(60); setText(el, v); } else { setNative(el, ''); await sleep(60); setNative(el, v); }
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+        n++;
+      }
+    }
+    return n;
+  }
   async function qSubmitGeneric() {
+    if (captchaVisible()) { setStatus('🧩 这页要过人机验证，请你点一下验证再继续。'); qOut('captcha', '要过人机验证'); return; }
+    if (!looksLikeRealApplication()) { setStatus('这页不像申请表（只有零星几格，可能是职位页上的分享 / 提醒小表单），不提交。'); qOut('noform', '页面不像申请表，没提交'); return; }
     const cm = S.profile.needSponsorship === 'Yes' && textOf(document.body).match(US_PERSON_RE);
     if (cm) { setStatus('⛔ 这个职位只收美国公民 / 绿卡，不投。'); qOut('ineligible', '只收美国公民 / 绿卡：' + cm[0]); return; }
-    const bad = qPreSubmitProblem();
+    let bad = qPreSubmitProblem();
+    if (bad === '简历栏是空的') {
+      for (const i of resumeInputs()) {
+        uploadedInputs.delete(i);
+        const zkey = location.pathname + '|' + (i.name || String(i.id).replace(/[-_]?\d+$/, '')) + '|' + precedingHeading(i);
+        uploadedZones.delete(zkey);
+        try { sessionStorage.removeItem('wdaf-up|' + zkey); } catch (_) { /* ignore */ }
+      }
+      await uploadResume();
+      await sleep(1500);
+      bad = qPreSubmitProblem();
+    }
     if (bad) { setStatus(`没自动提交：${bad}。请检查。`); qOut('ready', '没自动提交：' + bad); return; }
     if (isPinpoint()) { setStatus('✅ 都填好了。Pinpoint 不收插件点的提交（会报 500），请你检查一遍后自己点「Submit Application」。'); qOut('ready', 'Pinpoint 不收插件点的提交，等你自己点 Submit'); return; }
     if (captchaVisible()) { setStatus('🧩 提交前要过人机验证，请你点一下验证再点 Submit。'); qOut('captcha', '提交前要过人机验证'); return; }
     await submitSlot();
-    for (let attempt = 0; attempt < 2 && running; attempt++) {
+    const recommitted = await ashbyRecommit();
+    if (recommitted) { logAI(`🔁 Ashby：提交前把 ${recommitted} 道已答的题重新存了一遍`); await sleep(1200); }
+    for (let attempt = 0; attempt < 3 && running; attempt++) { // 第 3 次只在 AI 兜底改了东西之后才点（见下面 attempt === 1）
       const btn = findSubmitButton();
       if (!btn) break;
       const before = textOf(document.body);
@@ -4523,10 +5315,15 @@
       if (attempt === 0) {
         lastPageErrors = pageErrors();
         reviewedSigs.clear();
-        try { const rep = await fillPage(); if (rep.missing.length) { await addLog('提交被拒'); setStatus(`提交没过，还有 ${rep.missing.length} 个必填项没填`, rep.missing.map((f) => f.question)); return; } } finally { lastPageErrors = []; }
+        try { const rep = await fillPage(); if (rep.missing.length && !(await aiAnswerMissing(rep.missing, true))) { await addLog('提交被拒'); setStatus(`提交没过，还有 ${rep.missing.length} 个必填项没填`, rep.missing.map((f) => f.question)); return; } } finally { lastPageErrors = []; }
+      }
+      if (attempt === 1) {
+        const errs1 = pageErrors();
+        if (!errs1.length || /you have to meet these requirements to be able to apply/i.test(errs1.join(' ')) || !(await aiAdvancePage('submit-error', errs1))) break;
       }
     }
     const errs = pageErrors();
+    if (/you have to meet these requirements to be able to apply/i.test(errs.join(' ') + ' ' + textOf(document.body).slice(0, 20000))) { await addLog('不符合条件'); setStatus('⛔ 没过网站的硬性要求题（多半是担保），不投。'); qOut('ineligible', '没过硬性要求题：You have to meet these requirements to be able to apply'); return; }
     if (errs.length) await addLog('提交被拒');
     setStatus(errs.length ? `点了提交没成功，页面报错：${errs.slice(0, 3).join('；')}` : Q_BLOCKED_MSG);
     qOut('ready', errs.length ? '点了提交没成功：' + errs.slice(0, 3).join('；') : '网站没收插件点的提交，等你点一下 Submit');
@@ -4550,10 +5347,12 @@
       const body = textOf(document.body).slice(0, 6000);
       if (Q_DUP_RE.test(body) || /\/already-received\/?$/.test(location.pathname)) { qOut('dup', '页面说已经投过'); return; }
       if (Q_CLOSED_RE.test(body) || /[?&]error=true/.test(location.search) || /\/jobs\/jobnotfound\b/i.test(location.pathname)) { qOut('closed', '职位已关闭：' + ((body.match(Q_CLOSED_RE) || [])[0] || location.search)); return; }
+      if (QUEUE && QUEUE.url && /^\/([a-z]{2}(-[a-z]{2})?\/?)?$/i.test(location.pathname) && (() => { try { return new URL(QUEUE.url).pathname.split('/').filter(Boolean).length >= 2; } catch (_) { return false; } })()) { qOut('closed', '职位页跳回了招聘首页（职位多半已下线）'); return; }
       if (/application submission is (currently )?unavailable|please try again later/i.test(body) && /ashbyhq\.com$/.test(location.hostname)) { setStatus('⏸ Ashby 暂时不收申请（多半是网站的防机器人限制）。过一阵请你自己打开试。'); qOut('ready', 'Ashby 暂时不收申请（多半是防机器人限制），过一阵你自己试'); return; }
       if (S.profile.needSponsorship === 'Yes' && US_PERSON_RE.test(body)) { setStatus('⛔ 这个职位只收美国公民 / 绿卡 / U.S. Person，不投。'); qOut('ineligible', '只收美国公民 / U.S. Person：' + body.match(US_PERSON_RE)[0]); return; }
-      const a = qa('a, button, [role="button"], input[type="submit"], input[type="button"]')
-        .filter((e) => isVisible(e) && !e.closest('#wdaf-host'))
+      const rmk = q('a.dialogApplyBtn[href*="/talentcommunity/apply/"], a[href*="/talentcommunity/apply/"]');
+      const a = rmk || qa('a, button, [role="button"], input[type="submit"], input[type="button"]')
+        .filter((e) => isVisible(e) && !e.closest('#wdaf-host') && !(e.classList.contains('dropdown-toggle') && e.getAttribute('data-toggle') === 'dropdown'))
         .find((e) => Q_APPLY_RE.test(cleanLabel(textOf(e) || e.value || e.getAttribute('aria-label') || '').replace(/\s*[›»→>]+$/, '')));
       if (!a || (QUEUE.hops || 0) >= 6) continue;
       QUEUE.hops = (QUEUE.hops || 0) + 1;
@@ -4564,7 +5363,17 @@
       else a.click();
       await sleep(4000);
     }
-    if (!appDetected && !running && !proxyChild && !isWD()) qOut('noform', '没找到申请表或 Apply 按钮');
+    if (!appDetected && !running && !proxyChild && !isWD() && (/\/(sign[_-]?in|log[_-]?in)\b/i.test(location.pathname) || /^(sign ?in|log ?in)\b/i.test(document.title.trim()) || isSignInPage())) { const reg = fillRegistration(); if (reg) setStatus(registrationStatus(reg)); qOut('login', reg ? '注册账号已补填，等你确认' : '要登录或注册：' + location.hostname); return; }
+    if (!appDetected && !running && !proxyChild && !isWD() && /verify your identity|one-time (text |email |verification )?(code|passcode)|send (me )?a (verification|one-time) code/i.test(textOf(document.body).slice(0, 30000))) { qOut(mailOtpFields().length ? 'verify' : 'login', '要验证码验证身份：' + location.hostname); return; }
+    if (!appDetected && !running && !proxyChild && !isWD()) {
+      for (let k = 0; k < 2 && !appDetected && !running; k++) {
+        if (!(await aiAdvancePage('no-next', null, true))) break;
+        await sleep(5000);
+      }
+      if (appDetected || running) return;
+      if (/\/(sign[_-]?in|log[_-]?in)\b/i.test(location.pathname) || isSignInPage()) { qOut('login', '要登录或注册：' + location.hostname); return; }
+      qOut('noform', '没找到申请表或 Apply 按钮');
+    }
   }
 
   async function onReview() {
@@ -4591,9 +5400,12 @@
   async function runGeneric() {
     for (let guard = 0; guard < 30 && running && alive(); guard++) {
       if (isSignInPage()) {
-        setStatus('请先登录或注册（可用 Chrome 密码管理器），登录后点「自动到提交前」继续…');
+        if (mailOtpFields().length) { await fillMailboxCode(); qOut('verify', '等邮箱验证码 / 等你确认验证'); break; }
+        const reg = fillRegistration();
+        setStatus(reg ? registrationStatus(reg) : '请用该网站已有的账号登录，登录后自动继续…');
+        if (await submitRegistration(reg)) { await sleep(1500); continue; }
         qOut('login', '要登录或注册：' + location.hostname);
-        await waitFor(() => !running || !isSignInPage(), QUEUE ? 24 * 3600 * 1000 : 10 * 60 * 1000, 1000);
+        await waitForRegistration(() => !isSignInPage(), QUEUE ? 24 * 3600 * 1000 : 10 * 60 * 1000);
         await sleep(2000);
         continue;
       }
@@ -4607,28 +5419,48 @@
       setStatus('正在填写本页…');
       const rep = await fillPage();
       if (!running) break;
+      if (rep.mailOtp) { qOut('verify', '等邮箱验证码 / 等你确认验证'); break; }
       if (rep.missing.length && rep.missing.every((f) => /security code|verification code|enter the (8|eight)[- ]character code/i.test(f.question))) {
         setStatus(`📧 这页要邮箱验证码：Greenhouse 把 8 位验证码发到了 ${S.profile.email || '你的邮箱'}，请填进页面上的格子再点提交。`);
         qOut('verify', `Greenhouse 邮箱验证码（发到 ${S.profile.email || '邮箱'}）`);
         break;
       }
+      if (QUEUE && refAddrMissing(rep.missing)) { skipRefAddr(); break; }
+      if (QUEUE && foreignPhoneMasked()) { skipForeignPhone(); break; }
+      if (QUEUE && undergradOnlyQ(rep.missing)) { skipUndergrad(); break; }
       if (rep.missing.length) {
+        if (await aiAnswerMissing(rep.missing, true)) continue; // 必填第二轮：Codex 按「不留空」规则再答一次，答上了就重新过一遍本页
         setStatus(`本页还有 ${rep.missing.length} 个必填项没填（已标红）。你手动答完后再点「自动到提交前」继续，插件会记住你的答案，下次自动答。`, rep.missing.map((f) => f.question));
         break;
       }
       if (isMixedSignupPage()) {
-        setStatus('✅ 本页资料填好了，只剩「Create a login」的密码要你自己设（可用 Chrome 密码管理器）。设好后自己点页面上的继续按钮，插件会接着填下一页。');
-        qOut('login', '要设登录密码（Create a login）：' + location.hostname);
+        const reg = fillRegistration();
+        setStatus(reg ? registrationStatus(reg) : '本页资料填好了，请先完成注册。');
+        if (await submitRegistration(reg)) { await sleep(1500); continue; }
+        qOut('login', reg ? '注册账号已补填，等你确认' : '要设登录密码（Create a login）：' + location.hostname);
         const sig = pageSig();
-        await waitFor(() => !running || (!isMixedSignupPage() && pageSig() !== sig), QUEUE ? 24 * 3600 * 1000 : 15 * 60 * 1000, 1000);
+        await waitForRegistration(() => !isMixedSignupPage() && pageSig() !== sig, QUEUE ? 24 * 3600 * 1000 : 15 * 60 * 1000);
         if (!running) break;
         await sleep(2000);
         continue;
       }
+      const stay = stayOnJobButton();
+      if (stay) { setStatus('网站问要不要改看别的职位：点「Continue with this job」继续投这个…'); stay.click(); await sleep(2000); continue; }
       const next = findNextButton();
       if (next && findSubmitButton()) {
         setStatus('✅ 本页填好了。这页同时有「下一步」和「提交」按钮，请你检查后自己点。');
         break;
+      }
+      const gate = !next && !findSubmitButton() && consentGateButton();
+      if (gate) {
+        consentGated.add(location.href);
+        setStatus(`点「${buttonText(gate)}」同意申请者数据隐私声明…`);
+        const sig = pageSig();
+        gate.click();
+        await waitFor(() => !running || pageSig() !== sig, 10000, 500);
+        if (!running) break;
+        await sleep(1500);
+        continue;
       }
       if (!next && !findSubmitButton()) {
         const sig = pageSig();
@@ -4640,11 +5472,23 @@
         }
       }
       if (!next) {
+        if (QUEUE && QUEUE.url && /(^|\.)paycomonline\.(net|com)$/i.test(location.hostname) && /\/career-page\/?$/i.test(location.pathname) && !sessionStorage.getItem('wdaf-backToJob')) {
+          sessionStorage.setItem('wdaf-backToJob', '1');
+          setStatus('落到了招聘站的职位列表页，回到职位页接着投…');
+          location.assign(QUEUE.url);
+          break;
+        }
+        const closedBody = textOf(document.body).slice(0, 6000);
+        if (QUEUE && (/\/jobs?\/?notfound\b|\/jobnotfound\b/i.test(location.pathname) || /^(job|position|page) not found\b/i.test(document.title) || Q_CLOSED_RE.test(closedBody)) && !findSubmitButton()) {
+          qOut('closed', '职位已关闭：' + (document.title || location.pathname).slice(0, 60)); setStatus('这个职位已经关闭（页面：' + document.title.slice(0, 40) + '）。'); break;
+        }
+        if (!findSubmitButton() && !/(^|\.)paradox\.ai$/i.test(location.hostname) && await aiAdvancePage('no-next')) { await sleep(1200); continue; }
         await addLog('已填到提交前');
         await snapshotPage('最后一页');
         await healthCard();
         if (QUEUE && QUEUE_SUBMIT && findSubmitButton()) { await qSubmitGeneric(); break; }
-        if (QUEUE) qOut('ready', findSubmitButton() ? '填到最后一页了，等你点 Submit' : '没找到下一步 / 提交按钮');
+        const chatApply = /(^|\.)paradox\.ai$/i.test(location.hostname) && /\bchat to apply\b/i.test(textOf(document.body));
+        if (QUEUE) qOut('ready', chatApply ? 'Paradox 聊天投递（Chat to Apply），插件不会聊，要你自己点开聊天投' : findSubmitButton() ? '填到最后一页了，等你点 Submit' : '没找到下一步 / 提交按钮');
         setStatus(findSubmitButton()
           ? '✅ 已经填到最后一页。请从头检查一遍，确认无误后自己点 Submit。'
           : '✅ 本页填好了。没找到「下一步」按钮，请检查后自己继续或提交。');
@@ -4654,15 +5498,26 @@
       await snapshotPage(document.title + ' · ' + (collectFields()[0]?.question || '').slice(0, 30));
       const sig = pageSig();
       next.click();
-      const moved = await waitFor(() => !running || pageSig() !== sig, 15000, 500);
+      let moved = await waitFor(() => !running || pageSig() !== sig || stayOnJobButton(), 15000, 500);
+      if (running && stayOnJobButton()) { setStatus('网站问要不要改看别的职位：点「Continue with this job」继续投这个…'); stayOnJobButton().click(); moved = await waitFor(() => !running || pageSig() !== sig, 15000, 500); }
       if (!running) break;
       if (!moved) {
         const rr = await repairAndRetry(sig, 15000);
         if (!running) break;
         if (rr.moved) { await sleep(1500); continue; }
-        if (rr.missing) { setStatus(`本页还有 ${rr.missing.length} 个必填项没填（已标红）。你手动答完后再点「自动到提交前」继续，插件会记住你的答案，下次自动答。`, rr.missing.map((f) => f.question)); break; }
+        if (QUEUE && refAddrMissing(rr.missing)) { skipRefAddr(); break; }
+        if (QUEUE && undergradOnlyQ(rr.missing)) { skipUndergrad(); break; }
+        if (rr.missing) {
+          if (await aiAnswerMissing(rr.missing, true)) continue; // 必填第二轮
+          setStatus(`本页还有 ${rr.missing.length} 个必填项没填（已标红）。你手动答完后再点「自动到提交前」继续，插件会记住你的答案，下次自动答。`, rr.missing.map((f) => f.question)); break;
+        }
         const errs = pageErrors();
-        setStatus(errs.length ? `页面报错，请手动处理：${errs.slice(0, 3).join('；')}` : '点了下一步，但页面没有变化，请检查有没有漏填的。');
+        const hint = errs.length ? [] : [...new Set(qa('[aria-invalid="true"], [class*="error" i], [class*="invalid" i]').filter((e) => isVisible(e) && !e.closest('#wdaf-host'))
+          .map((e) => cleanLabel(e.matches('input, select, textarea, [role="combobox"]') ? (questionFor(e) || e.id || e.name || '') : textOf(e)).slice(0, 70)).filter((t) => t.length > 2))].slice(0, 5);
+        if (QUEUE && (captchaVisible() || await waitFor(captchaVisible, 6000, 400) || (/(^|\.)paycomonline\.(net|com)$/i.test(location.hostname) && q('iframe[src*="hcaptcha"]')))) { qOut('captcha', '点下一步后要过人机验证'); setStatus('🧩 网站弹了人机验证，请你点一下验证码再继续。'); break; }
+        if (QUEUE && errs.some((t) => /already (been )?registered|account (already )?exists|already have an account/i.test(t))) { qOut('login', '邮箱已在这个网站注册过，要登录：' + location.hostname); setStatus('这个邮箱已经在这个网站注册过账号，要登录后再申请，留给你。'); break; }
+        if (await aiAdvancePage('stuck', errs)) { await sleep(1200); continue; }
+        setStatus(errs.length ? `页面报错，请手动处理：${errs.slice(0, 3).join('；')}` : '点了下一步，但页面没有变化，请检查有没有漏填的。' + (hint.length ? `（标红：${hint.join('；')}）` : ''));
         break;
       }
       await sleep(1500);
@@ -4672,13 +5527,32 @@
   async function runAuto() {
     if (running) return;
     running = true;
+    try { sessionStorage.removeItem(USER_STOP_KEY); } catch (_) { /* ignore */ } // 明确要跑（面板按钮 / 队列 rerun）：解除「停止」
     qReported = false;
-    if (Q_DONE_PATH.test(location.pathname) && Q_DONE_RE.test(textOf(document.body).slice(0, 20000))) {
+    if (QUEUE && /verify your identity/i.test(textOf(document.body).slice(0, 30000)) && /one-time (text |email |verification )?(code|passcode)/i.test(textOf(document.body).slice(0, 30000))) {
+      running = false;
+      sessionStorage.removeItem(AUTO_KEY);
+      setStatus('这个网站申请前要验证身份，请先选择邮箱收码；已连接 Outlook 时会自动匹配填写。');
+      await fillMailboxCode();
+      qOut(mailOtpFields().length ? 'verify' : 'login', '要验证码验证身份：' + location.hostname);
+      renderPanel();
+      return;
+    }
+    if (QUEUE && (/[?&]status=alreadyApplied\b/i.test(location.search) || /you('ve| have) already applied (for|to) this (job|position|role|opportunity)/i.test(textOf(document.body).slice(0, 20000)))) {
+      running = false;
+      sessionStorage.removeItem(AUTO_KEY);
+      setStatus('这个职位以前已经投过（网站显示 already applied），不再填。');
+      qOut('dup', '网站显示已投过');
+      renderPanel();
+      return;
+    }
+    if ((Q_DONE_PATH.test(location.pathname) || (QUEUE && /\/apply\b|\/applications?\b/i.test(location.pathname) && !collectFields().length)) && Q_DONE_RE.test(textOf(document.body).slice(0, 20000))) {
       running = false;
       sessionStorage.removeItem(AUTO_KEY);
       await addLog('已提交');
       setStatus('🎉 已提交（这是提交成功页）');
       qOut('submitted', '提交成功页');
+      if (!QUEUE) { let last = ''; try { last = sessionStorage.getItem('wdaf-lastJob') || ''; } catch (_) { /* ignore */ } try { chrome.runtime.sendMessage({ type: 'queueDoneByUrl', url: last || location.href }, () => void chrome.runtime.lastError); } catch (_) { /* ignore */ } }
       renderPanel();
       return;
     }
@@ -4696,6 +5570,13 @@
     renderPanel();
     await loadState();
     try {
+      const jt = jobTitleFromPage();
+      if (QUEUE && !/bachelor|undergrad|associate/i.test(S.profile.degree || '') && /\bunder ?grad(uate)?s?\b/i.test(jt)
+        && !/\bgrad(uate)?s?\b|\bmasters?\b|\bmba\b|\bph\.?d\b|\bpost-?grad/i.test(jt.replace(/\bunder ?grad(uate)?s?\b/gi, ''))) {
+        setStatus('⛔ 这个职位只招本科生（你在读硕士），不投。');
+        qOut('ineligible', '只招本科生：' + jt.slice(0, 80));
+        return;
+      }
       if (!isWD()) { await runGeneric(); return; }
       for (let guard = 0; guard < 40 && running && alive(); guard++) {
         qProgress();
@@ -4718,16 +5599,20 @@
           continue;
         }
         if (isSignInPage()) {
-          setStatus('请先登录或创建账号（可用 Chrome 密码管理器），登录后会自动继续…');
+          if (mailOtpFields().length) { await fillMailboxCode(); qOut('verify', '等邮箱验证码 / 等你确认验证'); break; }
+          const reg = fillRegistration();
+          setStatus(reg ? registrationStatus(reg) : '请用该网站已有的账号登录，登录后会自动继续…');
+          if (await submitRegistration(reg)) { await sleep(1500); continue; }
           qOut('login', '要登录或创建 Workday 账号：' + location.hostname.split('.')[0]);
-          await waitFor(() => !running || !isSignInPage(), QUEUE ? 24 * 3600 * 1000 : 10 * 60 * 1000, 1000);
+          await waitForRegistration(() => !isSignInPage(), QUEUE ? 24 * 3600 * 1000 : 10 * 60 * 1000);
           await sleep(2000);
           continue;
         }
         const step = currentStep();
         if (!step) {
           setStatus('等待申请表加载…');
-          if (!(await waitFor(() => currentStep() || isSignInPage(), 15000, 500))) {
+          const startSoon = () => ['autofillWithResume', 'applyManually', 'adventureButton'].some((id) => isVisible(q(`[data-automation-id="${id}"]`)));
+          if (!(await waitFor(() => currentStep() || isSignInPage() || startSoon(), 15000, 500))) {
             const body = textOf(document.body).slice(0, 6000);
             if (QUEUE && Q_CLOSED_RE.test(body)) { qOut('closed', '职位已关闭：' + body.match(Q_CLOSED_RE)[0]); break; }
             if (QUEUE && Q_DUP_RE.test(body)) { qOut('dup', '页面说已经投过'); break; }
@@ -4741,7 +5626,12 @@
         setStatus(`正在填写：${step}`);
         const rep = await fillPage();
         if (!running) break;
+        if (rep.mailOtp) { qOut('verify', '等邮箱验证码 / 等你确认验证'); break; }
+        if (QUEUE && refAddrMissing(rep.missing)) { skipRefAddr(); break; }
+        if (QUEUE && foreignPhoneMasked()) { skipForeignPhone(); break; }
+        if (QUEUE && undergradOnlyQ(rep.missing)) { skipUndergrad(); break; }
         if (rep.missing.length) {
+          if (await aiAnswerMissing(rep.missing, true)) continue; // 必填第二轮
           setStatus(`「${step}」还有 ${rep.missing.length} 个必填项没填（已标红）。你手动答完后再点「自动到 Review」继续，插件会记住你的答案，下次自动答。`, rep.missing.map((f) => f.question));
           break;
         }
@@ -4757,8 +5647,16 @@
           const rr = await repairAndRetry(sig, 20000);
           if (!running) break;
           if (rr.moved) { await sleep(1200); continue; }
-          if (rr.missing) { setStatus(`「${step}」还有 ${rr.missing.length} 个必填项没填（已标红）。你手动答完后再点「自动到 Review」继续，插件会记住你的答案，下次自动答。`, rr.missing.map((f) => f.question)); break; }
+          if (QUEUE && refAddrMissing(rr.missing)) { skipRefAddr(); break; }
+          if (QUEUE && undergradOnlyQ(rr.missing)) { skipUndergrad(); break; }
+          if (rr.missing) {
+            if (await aiAnswerMissing(rr.missing, true)) continue; // 必填第二轮
+            setStatus(`「${step}」还有 ${rr.missing.length} 个必填项没填（已标红）。你手动答完后再点「自动到 Review」继续，插件会记住你的答案，下次自动答。`, rr.missing.map((f) => f.question)); break;
+          }
           const errs = pageErrors();
+          if (QUEUE && (captchaVisible() || await waitFor(captchaVisible, 6000, 400) || (/(^|\.)paycomonline\.(net|com)$/i.test(location.hostname) && q('iframe[src*="hcaptcha"]')))) { qOut('captcha', '点下一步后要过人机验证'); setStatus('🧩 网站弹了人机验证，请你点一下验证码再继续。'); break; }
+          if (QUEUE && errs.some((t) => /already (been )?registered|account (already )?exists|already have an account/i.test(t))) { qOut('login', '邮箱已在这个网站注册过，要登录：' + location.hostname); setStatus('这个邮箱已经在这个网站注册过账号，要登录后再申请，留给你。'); break; }
+          if (await aiAdvancePage('stuck', errs)) { await sleep(1200); continue; } // 页面级 AI 兜底（人机验证 / 要登录先查过了）
           setStatus(errs.length ? `页面报错，请手动处理：${errs.slice(0, 3).join('；')}` : '点了下一步，但页面没有变化，请检查。');
           break;
         }
@@ -4772,7 +5670,8 @@
       if (alive()) sessionStorage.removeItem(AUTO_KEY);
       renderPanel();
       if (QUEUE && alive()) {
-        if (!qReported) qOut('stuck', statusText, missingList);
+        if (!qReported && missingList.some((q) => CRED_RE.test(cleanLabel(String(q || ''))))) qOut('login', '要注册登录账号：' + statusText.slice(0, 120), missingList);
+        else if (!qReported) qOut('stuck', statusText, missingList);
         else if (['verify', 'captcha', 'ready'].includes(qLastState)) qWaitDone();
       }
     }
@@ -4785,7 +5684,8 @@
     try {
       setStatus('正在填写本页…');
       const rep = await fillPage();
-      setStatus(rep.missing.length
+      if (rep.mailOtp) return;
+      setStatus(rep.registration ? registrationStatus(rep.registration) : rep.missing.length
         ? `填了 ${rep.filled} 项，还有 ${rep.missing.length} 个必填项需要你手动填（已标红）。手动答过的题插件会记住。`
         : `填了 ${rep.filled} 项，本页必填项都已完成。`, rep.missing.map((f) => f.question));
     } catch (e) {
@@ -4801,7 +5701,7 @@
     if (!(appDetected || isWD())) return;
     const b = e.target.closest && e.target.closest('button, input[type="submit"], [role="button"]');
     if (!b) return;
-    if (isWD() ? /^submit( application)?$/i.test(textOf(b)) && /review/i.test(currentStep()) : SUBMIT_RE.test(buttonText(b))) addLog(QUEUE ? '已点提交' : '已提交');
+    if (!registrationForm() && !mailOtpFields().length && (isWD() ? /^submit( application)?$/i.test(textOf(b)) && /review/i.test(currentStep()) : SUBMIT_RE.test(buttonText(b)))) addLog(QUEUE ? '已点提交' : '已提交');
     if (!running && pending.length && b === findNextButton()) saveLearned(collectLearned());
   }, true);
 
@@ -4956,6 +5856,158 @@
     return { host, root, $ };
   }
 
+  const isSfXweb = () => /(^|\.)(sapsf|successfactors)\.(com|eu)$/i.test(location.hostname) && /^\/portalcareer/i.test(location.pathname);
+  const ui5Tag = (el) => (String(el.tagName || '').toLowerCase().match(/^ui5-([a-z-]+?)(?:-xweb-|$)/) || [])[1] || '';
+  const ui5All = () => qa('*').filter((e) => /^UI5-/.test(e.tagName));
+  const zwClean = (s) => String(s || '').replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim(); // 自动补全塞进来的零宽字符
+  const ui5Val = (h) => zwClean(h.getAttribute('value'));
+  let ui5Mark = 0;
+  const ui5Options = (h) => [...h.children].filter((o) => /^UI5-OPTION/.test(o.tagName)).map((el) => ({ el, text: zwClean(textOf(el) || el.getAttribute('text')) }));
+  const ui5SelText = (h) => { const o = [...h.children].find((x) => /^UI5-OPTION/.test(x.tagName) && x.hasAttribute('selected')); return o ? zwClean(textOf(o)) : ''; };
+  async function fillUi5Text(f, v) {
+    const h = f.ui5;
+    if (!h.getAttribute('data-wdaf-ui5')) h.setAttribute('data-wdaf-ui5', String(++ui5Mark));
+    const r = await new Promise((res) => { try { chrome.runtime.sendMessage({ type: 'ui5Text', mark: h.getAttribute('data-wdaf-ui5'), value: String(v) }, (x) => res(chrome.runtime.lastError ? null : x)); } catch (_) { res(null); } });
+    await sleep(300);
+    dbg('UI5 文字框', f.srQ, v, r);
+    return ui5Val(h) === String(v).trim();
+  }
+  async function fillIcimsAjax(sel, cands, ans) {
+    const a = document.getElementById(sel.id + '_icimsDropdown');
+    if (!a) return false;
+    const label = sel.getAttribute('data-label') || sel.getAttribute('aria-label') || '';
+    const isMajor = /major|field of study|concentration|discipline/i.test(label);
+    const isDegree = /degree/i.test(label);
+    const isSchool = !isDegree && !isMajor && /^(current )?(school|university|college|institution)\b/i.test(label.trim());
+    const bare = (c) => String(c).replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+    const all = [...new Set([...cands.map(String), ...cands.map(bare)].filter(Boolean))];
+    const masterDeg = isDegree && /^master/i.test(S.profile.degree || '');
+    const terms = [...new Set([...(masterDeg ? ["Master's", 'Master'] : []), ...all.slice(0, 4), ...all.map((t) => t.split(/[\s,(/'’]+/)[0]).filter((w) => w.length >= 3), ...(isMajor ? ['Management', 'Business', 'Other'] : []), ...(isSchool ? ['Other'] : [])])];
+    const picked = () => norm((sel.selectedOptions[0] || {}).text || '');
+    for (const term of terms.slice(0, 7)) {
+      if (!running) return false;
+      if (a.getAttribute('aria-expanded') !== 'true') { mouseClick(a); await sleep(400); }
+      const box = document.getElementById(sel.id + '_icimsDropdown_ctnr');
+      const search = box && box.querySelector('input.dropdown-search');
+      if (!search) return false;
+      typeInto(search, '');
+      search.dispatchEvent(new KeyboardEvent('keyup', { key: 'Backspace', bubbles: true }));
+      await sleep(200);
+      typeInto(search, term);
+      search.dispatchEvent(new KeyboardEvent('keydown', { key: term.slice(-1), bubbles: true }));
+      search.dispatchEvent(new KeyboardEvent('keyup', { key: term.slice(-1), bubbles: true }));
+      const list = () => qa('li', document.getElementById(sel.id + '_dropdown-results') || box).filter(isVisible)
+        .map((el) => ({ el, text: textOf(el) })).filter((o) => o.text && !/make a selection|no (results|matches)|searching|type to search/i.test(o.text));
+      let opts = [];
+      for (let i = 0; i < 15 && !opts.length; i++) { await sleep(300); opts = list(); }
+      if (!opts.length) continue;
+      let hit = null;
+      if (isDegree && /master|m\.?s\b/i.test(all.join(' ')) && !/mba|business admin/i.test(all.join(' '))) hit = opts.find((o) => /^master'?s( degree)?( \(non-mba\))?$/i.test(o.text.trim()));
+      if (isDegree) opts = opts.filter((o) => !/\bin\s+\w/i.test(o.text) || (S.profile.fieldOfStudy && norm(o.text).includes(norm(S.profile.fieldOfStudy))));
+      hit = hit || (opts.length ? chooseOption(opts, all, ans) : null);
+      if (!hit && isMajor && term === 'Management') hit = opts.find((o) => /^business \(management\)$/i.test(o.text.trim())) || opts.find((o) => /^(business )?management$|\bproject management\b/i.test(o.text.trim()));
+      if (!hit && isMajor && term === 'Business') hit = opts.find((o) => /^business( administration)?$/i.test(o.text.trim())) || opts.find((o) => /^business \(management\)$/i.test(o.text.trim()));
+      if (!hit && (isMajor || isSchool) && term === 'Other') hit = opts.find((o) => /^other\b|not listed/i.test(o.text));
+      if (!hit) continue;
+      mouseClick(hit.el);
+      await sleep(500);
+      if (picked() && picked() === norm(hit.text)) { logAI(`🔽 iCIMS 搜索下拉：${label.slice(0, 30)} → ${hit.text.slice(0, 30)}`); return true; }
+    }
+    if (a.getAttribute('aria-expanded') === 'true') pressKey(a, 'Escape');
+    return false;
+  }
+  async function fillUi5Suggest(f, cands) {
+    const h = f.ui5, inner = f.el;
+    const bare = (c) => String(c).replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+    cands = [...new Set([...cands.map(String), ...cands.map(bare)].filter(Boolean))];
+    const terms = [...new Set([...cands.slice(0, 4), ...cands.map(bare).map((t) => t.split(/[\s,(/]+/)[0]).filter((w) => w.length >= 3)])];
+    for (const c of terms.slice(0, 6)) {
+      const term = String(c).slice(0, 20);
+      inner.focus();
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(inner, term);
+      inner.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: term }));
+      inner.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, composed: true, key: term.slice(-1) }));
+      const items = await waitFor(() => { const it = [...h.children].filter((x) => /SUGGESTION-ITEM/.test(x.tagName)); return it.length ? it : null; }, 6000, 300);
+      if (!items) continue;
+      const opts = items.map((el) => ({ el, text: zwClean(el.getAttribute('text') || el.text || textOf(el)) }));
+      const hit = chooseOption(opts, cands, null) || (opts.length === 1 ? opts[0] : null);
+      if (!hit) continue;
+      const panel = document.getElementById('wdaf-host');
+      const pv = panel ? panel.style.visibility : '';
+      if (panel) panel.style.visibility = 'hidden';
+      const ok = await trustedClick(hit.el).catch(() => false);
+      if (panel) panel.style.visibility = pv;
+      if (!ok) mouseClick(hit.el);
+      await sleep(900);
+      if (ui5Val(h) && !h.hasAttribute('open')) { dbg('UI5 建议框选上', f.srQ, hit.text); return true; }
+    }
+    dbg('UI5 建议框没选上', f.srQ, cands);
+    return false;
+  }
+  async function resumeReplaceDialog(wait) {
+    const btn = () => qa('button, a, [role="button"]').find((b) => isVisible(b) && !b.closest('#wdaf-host') && (/^no,? (only |just )?(attach|upload|keep)\b.{0,40}(resume|cv)\b|^no,? keep my (existing|current) (information|entries|answers)/i.test(buttonText(b))
+      || (/^apply manually$/i.test(buttonText(b)) && qa('button, a, [role="button"]').some((x) => isVisible(x) && /^autofill with (resume|cv)/i.test(buttonText(x))))));
+    const b = wait ? await waitFor(btn, wait, 300) : btn();
+    if (!b) return 0;
+    mouseClick(b);
+    await sleep(800);
+    logAI('📎 简历只附上、不用它重填申请');
+    return 1;
+  }
+  async function paycomRefOptIn() {
+    const refs = Array.isArray(S.profile.references) ? S.profile.references.filter((r) => r && r.name) : [];
+    if (!refs.length) return 0;
+    let n = 0;
+    for (const c of qa('input[type="checkbox"][id*="reference-has-opted-out"], input[type="checkbox"][name*="reference-has-opted-out"]')) {
+      const idx = Number((String(c.id || c.name).match(/(\d+)$/) || [])[1] || 1);
+      if (!c.checked || idx > refs.length) continue;
+      (c.closest('label') || c).click();
+      await sleep(400);
+      if (c.checked) c.click();
+      n++;
+    }
+    if (n) { logAI(`👥 取消「I do not have an entry」，填推荐人（${n} 处）`); await sleep(600); }
+    return n;
+  }
+  async function paycomSignature() {
+    const box = document.getElementById('authorization-signature-image-field');
+    if (!box || !isVisible(box)) return 0;
+    const field = box.closest('div[class]')?.parentElement || box;
+    let inp = qa('input[type="text"], input:not([type])', box).find(isVisible);
+    if (!inp) {
+      const tab = qa('button', field.parentElement || document).find((b) => isVisible(b) && /^type$/i.test(buttonText(b)));
+      if (!tab) return 0;
+      mouseClick(tab);
+      await sleep(600);
+      inp = qa('input[type="text"], input:not([type])', box).find(isVisible);
+    }
+    if (!inp || inp.value.trim()) return 0;
+    const name = valueFor('FULLNAME');
+    if (!(await trustedType(inp, name))) setText(inp, name);
+    await sleep(400);
+    logAI('✍️ 签名区输入全名：' + name);
+    return 1;
+  }
+  async function sfResumeDialog(wait) {
+    if (!isSfXweb()) return 0;
+    const noOpt = () => ui5All().find((h) => ui5Tag(h) === 'radio-button' && /^no update required$/i.test(zwClean(h.getAttribute('text'))) && isVisible(h));
+    const no = wait ? await waitFor(noOpt, wait, 300) : noOpt();
+    if (!no) return 0;
+    if (!isChecked(no)) { await trustedClick(no); await sleep(300); if (!isChecked(no)) { no.click(); await sleep(300); } }
+    const btn = ui5All().find((h) => ui5Tag(h) === 'button' && /^confirm$/i.test(textOf(h)) && isVisible(h) && !h.hasAttribute('disabled'));
+    if (btn) { btn.click(); await sleep(1000); }
+    dbg('SF 简历弹窗：No Update Required', isChecked(no), !!btn);
+    return 1;
+  }
+  async function ui5SelectSet(h, opt) {
+    if (!h.getAttribute('data-wdaf-ui5')) h.setAttribute('data-wdaf-ui5', String(++ui5Mark));
+    const text = zwClean(textOf(opt));
+    const r = await new Promise((res) => { try { chrome.runtime.sendMessage({ type: 'ui5SelSet', mark: h.getAttribute('data-wdaf-ui5'), text }, (x) => res(chrome.runtime.lastError ? null : x)); } catch (_) { res(null); } });
+    await sleep(400);
+    dbg('UI5 下拉设值', text, r);
+    return ui5SelText(h) === text;
+  }
+  const ui5GroupQ = (h) => zwClean((h.closest('[accessible-name]') && h.closest('[accessible-name]').getAttribute('accessible-name')) || (h.closest('[aria-label]') && h.closest('[aria-label]').getAttribute('aria-label')) || precedingText(h.parentElement) || '');
   const isGoogleForm = () => location.hostname === 'docs.google.com' && /^\/forms\//.test(location.pathname)
     && /application|intern(ship)?\b|career|\bjobs?\b|recruit|hiring|candidate/i.test(document.title + ' ' + textOf(q('[role="heading"]')));
   let appDetected = false;
@@ -4970,6 +6022,7 @@
     if (/\/CandidateExperience\/.*\/(easy-)?apply(\/|$)/i.test(location.pathname)) return true;
     if (/\/CandidateExperience\//i.test(location.pathname)) return false;
     if (isGoogleForm()) return true;
+    if (isSfXweb()) return true;
     if (APPLY_URL_RE.test(location.pathname + location.search) && qa('input:not([type="hidden"]), select, textarea, [role="combobox"], [role="radio"]').some((e) => !e.closest('#wdaf-host') && isVisible(e))) return true;
     const vis = qa('input:not([type="hidden"]), select, textarea').filter((e) => !e.closest('#wdaf-host') && (isVisible(e) || e.type === 'file'));
     if (vis.length < 3) return false;
@@ -4984,7 +6037,8 @@
   function stopRun() {
     running = false;
     sessionStorage.removeItem(AUTO_KEY);
-    setStatus('已停止');
+    try { sessionStorage.setItem(USER_STOP_KEY, '1'); } catch (_) { /* ignore */ }
+    setStatus('已停止（这个标签页不会再自动填 / 自动开始，要继续请点「自动到提交前」）');
   }
 
   function setResumeOverride(id) {
@@ -5082,8 +6136,8 @@
   }
 
   chrome.storage.onChanged.addListener(async (changes, area) => {
-    if (area === 'local' && (changes.profile || changes.settings || changes.resume || changes.resumes || changes.defaultResumeId)) {
-      if (!(appDetected || isWD())) return;
+    if (area === 'local' && (changes.profile || changes.settings || changes.registration || changes.mailbox || changes.resume || changes.resumes || changes.defaultResumeId)) {
+      if (!(appDetected || isWD() || registrationForm())) return;
       await loadState();
       await refreshPick();
     }
@@ -5091,8 +6145,8 @@
 
   const ATS_HOST = (/(^|\.)(paradox\.ai|applytojob\.com|paylocity\.com)$/i.test(location.hostname) && !/\/recruiting\/jobs\/details\//i.test(location.pathname))
     || (/(^|\.)myapps\.paychex\.com$/i.test(location.hostname) && /\/appone\//i.test(location.pathname));
-  const APPLY_URL_RE = /\/apply(\/|$|\?)|\/application(s)?\b|job_app|\/candidate\/|\/appone\//i;
-  const maybeApplication = () => !isTrackerFrame() && (isWD() || ATS_HOST || isGoogleForm() || (isSR() && /\/oneclick-ui\//.test(location.pathname)) || APPLY_URL_RE.test(location.pathname + location.search) || /\/CandidateExperience\/.*\/(easy-)?apply(\/|$)/i.test(location.pathname) || (!!q('input[type="email"], input[type="file"], input[name*="mail" i], input[id*="mail" i], input[autocomplete="email"], input[placeholder*="mail" i]') && looksLikeApplication()));
+  const APPLY_URL_RE = /\/apply(\/|$|\?)|\/application(s)?\b|job_app|\/candidate\/|\/appone\/|\/onboardingform\//i;
+  const maybeApplication = () => !isTrackerFrame() && (isWD() || ATS_HOST || isSfXweb() || isGoogleForm() || !!registrationForm() || mailOtpFields().length > 0 || (isSR() && /\/oneclick-ui\//.test(location.pathname)) || APPLY_URL_RE.test(location.pathname + location.search) || /\/CandidateExperience\/.*\/(easy-)?apply(\/|$)/i.test(location.pathname) || (qa('input[type="email"], input[type="file"], input[name*="mail" i], input[id*="mail" i], input[autocomplete="email"], input[placeholder*="mail" i]').some((i) => !isSubscribeForm(i.closest('form')) && !JOB_ALERT_FIELD_RE.test(`${i.id || ''} ${i.name || ''}`)) && looksLikeApplication())); // 职位页上订阅职位提醒的邮箱框（Barclays）不算申请表
 
   async function onDetected() {
     appDetected = true;
@@ -5108,11 +6162,41 @@
       setStatus('继续自动流程…');
       await sleep(1500);
       runAuto();
-    } else if (QUEUE && !running) {
+    } else if (QUEUE && !running && !userStopped()) {
+      if (undergradOnlyJD()) { skipUndergrad('职位说明写明只招在读本科生'); return; }
       setStatus('批量队列：开始自动填写…');
       await sleep(1500);
       if (!running) runAuto();
     }
+  }
+
+  if (isPinpoint() && !IN_FRAME) {
+    const freshTokenOnSubmit = (form) => {
+      if (form.dataset.wdafToken) return;
+      form.dataset.wdafToken = '1';
+      form.addEventListener('submit', async (e) => {
+        if (form.dataset.wdafTokenFresh === '1') return;
+        const tok = form.querySelector('input[name="authenticity_token"]');
+        if (!tok) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const submitter = e.submitter;
+        try {
+          const html = await (await fetch(location.pathname.replace(/\/applications\/?$/, '/applications/new'), { credentials: 'same-origin', cache: 'no-store' })).text();
+          const doc = new DOMParser().parseFromString(html, 'text/html');
+          const action = form.getAttribute('action');
+          const fresh = doc.querySelector(`form[action="${CSS.escape(action)}"] input[name="authenticity_token"]`)?.value || doc.querySelector('meta[name="csrf-token"]')?.content;
+          if (fresh) { tok.value = fresh; const m = document.querySelector('meta[name="csrf-token"]'); if (m) m.content = fresh; }
+          dbg('Pinpoint 提交前换了新令牌', !!fresh);
+        } catch (err) { dbg('Pinpoint 取新令牌失败', err && err.message); }
+        form.dataset.wdafTokenFresh = '1';
+        if (form.requestSubmit) form.requestSubmit(submitter && submitter.form === form ? submitter : undefined); else form.submit();
+        setTimeout(() => { form.dataset.wdafTokenFresh = ''; }, 5000);
+      }, true);
+    };
+    const hookForms = () => qa('form[action$="/applications"]').filter((f) => (f.getAttribute('method') || '').toLowerCase() === 'post').forEach(freshTokenOnSubmit);
+    hookForms();
+    setTimeout(hookForms, 3000);
   }
 
   try {
@@ -5154,6 +6238,9 @@
   const timer = setInterval(() => {
     if (!booted) return;
     if (!alive()) { running = false; showStale(); clearInterval(timer); return; }
+    const reg = userStopped() ? null : fillRegistration(); // 点过「停止」的页不再每几秒补填注册栏（Nomura：密码一删就被补回去）
+    if (reg && reg.filled) setStatus(registrationStatus(reg));
+    fillMailboxCode().catch(() => setStatus('邮箱取码失败，请手动输入验证码。'));
     if (panel && !panel.host.isConnected && (appDetected || isWD() || childState)) renderPanel();
     if (!appDetected && !isWD()) {
       if ((document.visibilityState === 'visible' || QUEUE) && maybeApplication()) onDetected();
@@ -5173,6 +6260,8 @@
     booted = true;
     if (!IN_FRAME) { try { chrome.runtime.sendMessage({ type: 'devCheck' }); } catch (_) { /* ignore */ } }
     await loadState();
+    const reg = userStopped() ? null : fillRegistration();
+    if (reg) setStatus(registrationStatus(reg));
     try {
       if (document.prerendering) throw new Error('prerender');
       const r = await new Promise((res) => { setTimeout(() => res(null), 2000); chrome.runtime.sendMessage({ type: 'queueHello' }, (x) => { void chrome.runtime.lastError; res(x); }); });
@@ -5181,6 +6270,6 @@
     if (!IN_FRAME) for (const f of qa('iframe')) { try { f.contentWindow.postMessage({ __wdaf: 'cmd', cmd: 'ping' }, '*'); } catch (_) { /* ignore */ } }
     if (maybeApplication()) onDetected();
     else renderPanel(); // 不是申请页：什么都不做，等上面的定时检查
-    if (QUEUE && !IN_FRAME) queueDrive();
+    if (QUEUE && !IN_FRAME && !userStopped()) queueDrive();
   })();
 })();

@@ -161,7 +161,7 @@ const SETTINGS_SCHEMA = [
 ];
 
 const $ = (s) => document.querySelector(s);
-const state = { profile: {}, settings: {}, resumes: [], defaultResumeId: '', log: [] };
+const state = { profile: {}, settings: {}, registration: { email: '', password: '' }, mailbox: { clientId: '', email: '', enabled: false, watchEnabled: false, autoArchive: false, watchStartedAt: 0 }, resumes: [], defaultResumeId: '', log: [] };
 
 function el(tag, attrs = {}, children = []) {
   const e = document.createElement(tag);
@@ -188,13 +188,26 @@ function renderField(group, key, label, type, flag) {
   if (Array.isArray(type)) {
     input = el('select', { id }, type.map(([v, t]) => el('option', { value: v, text: t })));
   } else {
-    input = el('input', { type: type === 'number' ? 'number' : 'text', id });
+    input = el('input', { type: type === 'number' ? 'number' : type === 'password' ? 'password' : 'text', id, ...(type === 'password' ? { autocomplete: 'new-password' } : {}) });
   }
   return el('label', { className: `field ${flag || ''}` }, [el('span', { text: label }), input]);
 }
 
 function renderForm() {
   const root = $('#form');
+  root.append(el('section', { className: 'card' }, [
+    el('h2', { text: '注册账号与邮箱验证码' }),
+    el('p', { className: 'hint', text: '在招聘网站注册页补填邮箱、密码和确认密码，已有内容保留。注册按钮由你确认。密码只用于注册填写，不交给 AI。' }),
+    el('div', { className: 'grid' }, [renderField('registration', 'email', '统一注册邮箱'), renderField('registration', 'password', '统一注册密码', 'password')]),
+    el('p', { className: 'hint', text: '在自己的 Azure / Entra 目录注册 Microsoft 应用（支持个人 Microsoft 账户、启用公共客户端流），填入 Client ID，再登录授权。个人账号若提示没有目录，需要先完成 Azure 开户。自动取码申请读取权限；自动归档另需邮件读写权限，不申请发送邮件权限。' }),
+    el('a', { href: 'https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade', target: '_blank', rel: 'noopener', text: '打开 Microsoft 应用注册' }),
+    el('div', { className: 'grid' }, [renderField('mailbox', 'clientId', 'Microsoft 应用 Client ID'), renderField('mailbox', 'email', '收验证码的 Outlook 邮箱'), renderField('mailbox', 'enabled', '授权后自动读取并填写邮箱验证码', 'check'), renderField('mailbox', 'watchEnabled', '自动跟踪求职邮件，有用的新邮件提醒我', 'check'), renderField('mailbox', 'autoArchive', '明确拒信和普通申请回执自动移到 Outlook「存档」', 'check')]),
+    el('p', { className: 'hint', text: '从开启后的新邮件开始，Chrome 打开时每 5 分钟检查，关闭期间的新邮件会在重开后补查。面试、测评、补材料、录用及不明确的招聘往来保留并提醒；验证码不归档。' }),
+    el('div', { className: 'row' }, [el('button', { type: 'button', id: 'mailConnect', text: '连接 Outlook 邮箱' }), el('button', { type: 'button', id: 'mailDisconnect', className: 'ghost', text: '断开邮箱' }), el('button', { type: 'button', id: 'mailCheckNow', className: 'ghost', text: '立即检查求职邮件' })]),
+    el('p', { id: 'mailStatus', className: 'hint', 'aria-live': 'polite', text: '未连接。需要 Client ID 和微软授权。' }),
+    el('p', { id: 'mailWatchStatus', className: 'hint', 'aria-live': 'polite' }),
+    el('div', { id: 'mailWatchList' }),
+  ]));
   for (const sec of SCHEMA) {
     root.append(el('section', { className: 'card' }, [
       el('h2', { text: sec.title }),
@@ -209,7 +222,7 @@ function renderForm() {
 }
 
 function fillForm() {
-  for (const [group, obj] of [['profile', state.profile], ['settings', state.settings]]) {
+  for (const [group, obj] of [['profile', state.profile], ['settings', state.settings], ['registration', state.registration], ['mailbox', state.mailbox]]) {
     for (const [k, v] of Object.entries(obj)) {
       const input = document.getElementById(`${group}-${k}`);
       if (!input) continue;
@@ -295,7 +308,7 @@ function renderCoverLetters() {
 }
 
 function readForm() {
-  for (const [group, obj] of [['profile', state.profile], ['settings', state.settings]]) {
+  for (const [group, obj] of [['profile', state.profile], ['settings', state.settings], ['registration', state.registration], ['mailbox', state.mailbox]]) {
     for (const k of Object.keys(obj)) {
       const input = document.getElementById(`${group}-${k}`);
       if (!input) continue;
@@ -304,7 +317,7 @@ function readForm() {
       else if (input.dataset.json) {
         try { const v = JSON.parse(input.value.trim() || '[]'); if (!Array.isArray(v)) throw new Error('要是 [ … ] 列表'); obj[k] = v; }
         catch (e) { toast(`「${k}」不是有效的 JSON，没保存这一项：${e.message}`); }
-      } else obj[k] = input.value.trim();
+      } else obj[k] = input.type === 'password' ? input.value : input.value.trim();
     }
   }
 }
@@ -333,7 +346,9 @@ function toast(msg) {
 }
 
 async function load() {
-  const d = await chrome.storage.local.get(['profile', 'settings', 'resume', 'resumes', 'defaultResumeId', 'customRules', 'log', 'transcript', 'coverLetters']);
+  const d = await chrome.storage.local.get(['profile', 'settings', 'registration', 'mailbox', 'resume', 'resumes', 'defaultResumeId', 'customRules', 'log', 'transcript', 'coverLetters']);
+  state.registration = { email: '', password: '', ...(d.registration || {}) };
+  state.mailbox = { clientId: '', email: d.registration?.email || '', enabled: false, watchEnabled: false, autoArchive: false, watchStartedAt: 0, ...(d.mailbox || {}) };
   state.transcript = d.transcript || null;
   state.coverLetters = d.coverLetters || {};
   state.profile = wdafMergeProfile(d.profile);
@@ -346,6 +361,7 @@ async function load() {
   renderLog();
   renderGuesses();
   renderSnapshots();
+  renderMailWatch();
 }
 
 let rulesShown = '';
@@ -361,11 +377,15 @@ chrome.storage.onChanged.addListener((changes, area) => {
 chrome.storage.onChanged.addListener((changes, area) => { if (area === 'local' && changes.appSnapshots) renderSnapshots(); });
 
 async function save() {
+  const wasWatching = state.mailbox.watchEnabled;
   readForm();
+  if (state.mailbox.watchEnabled && !wasWatching) state.mailbox.watchStartedAt = Date.now();
   rulesShown = $('#customRules').value;
   await chrome.storage.local.set({
     profile: state.profile,
     settings: state.settings,
+    registration: state.registration,
+    mailbox: state.mailbox,
     customRules: rulesShown,
   });
   toast('已保存 ✓');
@@ -411,6 +431,88 @@ async function checkUpdate() {
 renderForm();
 load();
 checkUpdate();
+
+function mailboxRequest(action, data = {}) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'mailbox', action, ...data }, (r) => {
+      const err = chrome.runtime.lastError;
+      resolve(err ? { ok: false, error: '本地连接不可用，请安装或更新本地连接。' } : r || { ok: false, error: '邮箱连接没有响应。' });
+    });
+  });
+}
+let mailAuthRun = 0;
+$('#mailConnect').onclick = async () => {
+  const out = $('#mailStatus');
+  readForm();
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(state.mailbox.clientId)) { out.textContent = '请先注册自己的 Microsoft 应用并填入 Client ID。'; return; }
+  if (!state.mailbox.email) { out.textContent = '请先填入收验证码的 Outlook 邮箱。'; return; }
+  const run = ++mailAuthRun;
+  $('#mailConnect').disabled = true;
+  try {
+    out.textContent = '正在请求微软授权…';
+    const r = await mailboxRequest('mailStart', state.mailbox);
+    if (run !== mailAuthRun) return;
+    if (!r.ok) { out.textContent = r.error; return; }
+    out.textContent = `请在微软页面输入授权码 ${r.userCode}，用 ${state.mailbox.email} 登录并授权。等待完成…`;
+    await chrome.tabs.create({ url: r.url });
+    const deadline = Date.now() + Math.min(Number(r.expiresIn) || 900, 900) * 1000;
+    let interval = Math.max(5, Number(r.interval) || 5);
+    while (run === mailAuthRun && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, interval * 1000));
+      if (run !== mailAuthRun) return;
+      const p = await mailboxRequest('mailPoll');
+      if (run !== mailAuthRun) return;
+      if (!p.ok) { out.textContent = p.error; return; }
+      if (p.pending) { interval = Math.max(interval, Number(p.interval) || 5); continue; }
+      if (p.connected) {
+        state.mailbox.email = p.email;
+        state.mailbox.enabled = true;
+        $('#mailbox-enabled').checked = true;
+        await chrome.storage.local.set({ mailbox: state.mailbox });
+        out.textContent = `已连接 ${p.email}，遇到邮箱验证码会自动匹配并填写。`;
+        return;
+      }
+    }
+    if (run === mailAuthRun) out.textContent = '授权超时，请重新连接。';
+  } finally { $('#mailConnect').disabled = false; }
+};
+$('#mailDisconnect').onclick = async () => {
+  mailAuthRun++;
+  const r = await mailboxRequest('mailDisconnect');
+  if (!r.ok) { $('#mailStatus').textContent = r.error; return; }
+  state.mailbox.enabled = false;
+  state.mailbox.watchEnabled = false;
+  $('#mailbox-enabled').checked = false;
+  $('#mailbox-watchEnabled').checked = false;
+  await chrome.storage.local.set({ mailbox: state.mailbox });
+  $('#mailStatus').textContent = '已断开，已清除本地邮箱令牌。可在微软账户的应用授权页撤销远程权限。';
+};
+mailboxRequest('mailStatus').then((r) => {
+  if (r.ok && r.connected) $('#mailStatus').textContent = `已连接 ${r.email}${state.mailbox.autoArchive && !r.canArchive ? '；自动归档尚未授权，请重新连接。' : ''}`;
+});
+
+async function renderMailWatch() {
+  const { mailWatch = {} } = await chrome.storage.local.get('mailWatch');
+  const box = $('#mailWatchList');
+  box.textContent = '';
+  $('#mailWatchStatus').textContent = mailWatch.error || (mailWatch.checkedAt ? `上次检查：${new Date(mailWatch.checkedAt).toLocaleString('zh-CN')}；已归档 ${mailWatch.archived || 0} 封。` : '邮箱跟踪尚未开始，连接并保存设置后启用。');
+  const labels = { important: '需要行动', review: '待你查看', rejection: '拒信', receipt: '申请回执' };
+  for (const item of [...(mailWatch.history || [])].sort((a, b) => b.received - a.received).slice(0, 12)) {
+    box.append(el('div', { className: 'resume' }, [
+      el('b', { text: `${labels[item.kind] || '招聘邮件'}${item.archived ? ' · 已归档' : ' · 保留在收件箱'}` }),
+      el('a', { href: item.url, target: '_blank', rel: 'noopener', text: item.subject || '打开邮件' }),
+      el('span', { className: 'hint', text: `${item.from || ''} · ${new Date(item.received * 1000).toLocaleString('zh-CN')} · ${item.reason || ''}` }),
+    ]));
+  }
+}
+chrome.storage.onChanged.addListener((changes, area) => { if (area === 'local' && changes.mailWatch) renderMailWatch(); });
+$('#mailCheckNow').onclick = async () => {
+  await save();
+  $('#mailCheckNow').disabled = true;
+  $('#mailWatchStatus').textContent = '正在检查新的求职邮件…';
+  try { const r = await mailboxRequest('mailWatchNow'); if (!r.ok) $('#mailWatchStatus').textContent = r.error; else await renderMailWatch(); }
+  finally { $('#mailCheckNow').disabled = false; }
+};
 
 $('#save').addEventListener('click', save);
 $('#customRules').addEventListener('input', () => renderGuesses());

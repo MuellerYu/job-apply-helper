@@ -48,7 +48,7 @@ main { padding-left: 0; padding-right: 0; }
 .field.check { flex-direction: row; align-items: flex-start; gap: 8px; grid-column: 1 / -1; }
 .field.check > span { color: var(--text); }
 .field.warn > span { background: var(--warn-bg); padding: 2px 6px; border-radius: 4px; }
-input[type=text], input[type=number], select, textarea {
+input[type=text], input[type=password], input[type=number], select, textarea {
   width: 100%;
   padding: 7px 9px;
   border: 1px solid var(--line);

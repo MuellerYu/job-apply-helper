@@ -2,8 +2,80 @@ chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'openOptions') chrome.runtime.openOptionsPage();
+  if (msg && msg.type === 'mailbox') {
+    const ownOptions = sender.url === chrome.runtime.getURL('options.html');
+    const action = msg.action;
+    if (ownOptions && action === 'mailWatchNow') { mailWatchTick().then(sendResponse, () => sendResponse({ ok: false, error: '邮箱检查失败，请稍后再试。' })); return true; }
+    if (action === 'mailCode' && sender.tab) {
+      (async () => {
+        const { mailbox = {} } = await chrome.storage.local.get('mailbox');
+        if (!mailbox.enabled || !mailbox.email) return sendResponse({ ok: false, error: '请先在设置中连接并开启 Outlook 自动取码。' });
+        sendResponse(await callHost({ action, email: mailbox.email, url: sender.url, since: msg.since, length: msg.length }, 30000));
+      })().catch(() => sendResponse({ ok: false, error: '邮箱连接失败，请重新连接。' }));
+      return true;
+    }
+    if (ownOptions && ['mailStart', 'mailPoll', 'mailStatus', 'mailDisconnect'].includes(action)) {
+      callHost({ action, clientId: msg.clientId, email: msg.email, archive: !!(msg.watchEnabled && msg.autoArchive) }, 30000).then(sendResponse);
+      return true;
+    }
+    sendResponse({ ok: false, error: '请从插件设置页连接邮箱。' });
+    return;
+  }
+  if (msg && msg.type === 'ui5Text' && sender.tab) {
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, frameIds: [sender.frameId || 0] }, world: 'MAIN', args: [String(msg.mark), String(msg.value)],
+      func: async (mark, value) => {
+        const h = document.querySelector('[data-wdaf-ui5="' + mark + '"]');
+        const inner = h && h.shadowRoot && h.shadowRoot.querySelector('input, textarea');
+        if (!inner) return 'noinput';
+        const sl = (ms) => new Promise((r) => setTimeout(r, ms));
+        inner.focus();
+        Object.getOwnPropertyDescriptor(inner.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value').set.call(inner, value);
+        inner.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: value }));
+        inner.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, composed: true, key: 'End' }));
+        await sl(100);
+        inner.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        await sl(150);
+        inner.dispatchEvent(new FocusEvent('focusout', { bubbles: true, composed: true }));
+        inner.blur();
+        await sl(100);
+        if (String(h.value) !== value) h.value = value; // 组件显示和网站数据对齐（改过的栏有时还显示旧字）
+        return 'ok';
+      },
+    }).then((r) => sendResponse({ ok: !!(r && r[0] && r[0].result === 'ok'), r: r && r[0] && r[0].result })).catch((e) => sendResponse({ ok: false, error: String(e) }));
+    return true;
+  }
+  if (msg && msg.type === 'ui5SelSet' && sender.tab) {
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, frameIds: [sender.frameId || 0] }, world: 'MAIN', args: [String(msg.mark), String(msg.text)],
+      func: (mark, text) => {
+        const h = document.querySelector('[data-wdaf-ui5="' + mark + '"]');
+        if (!h) return 'nohost';
+        const clean = (s) => String(s || '').replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim();
+        const o = [...h.children].find((x) => /^UI5-OPTION/.test(x.tagName) && clean(x.textContent) === text);
+        if (!o) return 'noopt';
+        h.value = o.value;
+        const d = { detail: { selectedOption: o }, bubbles: true, composed: true };
+        h.dispatchEvent(new CustomEvent('ui5-change', d));
+        h.dispatchEvent(new CustomEvent('change', d));
+        return 'ok';
+      },
+    }).then((r) => sendResponse({ ok: !!(r && r[0] && r[0].result === 'ok'), r: r && r[0] && r[0].result })).catch((e) => sendResponse({ ok: false, error: String(e) }));
+    return true;
+  }
   if (msg && msg.type === 'devCheck') devCheck();
   if (msg && msg.type === 'ai' && msg.payload) {
+    const tid = sender && sender.tab ? sender.tab.id : 0;
+    const act = String(msg.payload.action || '');
+    if (/^(answer|review|operate|advance)$/.test(act)) {
+      const now = Date.now();
+      const arr = (aiCalls.get(tid) || []).filter((t) => now - t < 10 * 60000);
+      arr.push(now);
+      aiCalls.set(tid, arr);
+      if (arr.length > 25) { sendResponse({ ok: false, error: '这页 10 分钟内调了 25 次 AI，疑似在循环，已停下这页' }); return; }
+      const total = [...aiCalls.values()].reduce((s, a) => s + a.filter((t) => now - t < 10 * 60000).length, 0);
+      if (total > 120) { sendResponse({ ok: false, error: '所有页 10 分钟内合计调了 120 次 AI，疑似在循环，已停下这页' }); return; }
+    }
     callHost(msg.payload, msg.timeout || 300000).then(sendResponse);
     return true; // 异步回复
   }
@@ -49,6 +121,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (r && r.started) sent++;
       }
       sendResponse({ sent });
+    })();
+    return true;
+  }
+  if (msg && msg.type === 'queueDoneByUrl' && sender && sender.tab) {
+    (async () => {
+      const key = qUrlKey(String(msg.url || ''));
+      let hit = null;
+      await qTx((Q) => {
+        hit = Q.items.find((x) => x.status !== 'submitted' && (qUrlKey(x.url) === key || (x.lastUrl && qUrlKey(x.lastUrl) === key)));
+        if (hit) Object.assign(hit, { status: 'submitted', need: '', tabId: null, ended: Date.now(), note: '提交成功页（标签页之前跟队列断了，按职位网址找回）' });
+      });
+      if (hit) setTimeout(() => qCloseQuiet(sender.tab.id), 2500);
+      sendResponse({ ok: !!hit });
     })();
     return true;
   }
@@ -144,7 +229,7 @@ async function importBundledConfig() {
   } catch (_) {
     return false;
   }
-  const cur = await chrome.storage.local.get(['configVersion', 'profile', 'settings']);
+  const cur = await chrome.storage.local.get(['configVersion', 'profile', 'settings', 'mailbox']);
   if (!cfg.version || cur.configVersion === cfg.version) return false;
 
   const resumes = [];
@@ -172,6 +257,8 @@ async function importBundledConfig() {
     profile: { ...(cur.profile || {}), ...nonEmpty(cfg.profile) },
   };
   if (cfg.settings) set.settings = { ...(cur.settings || {}), ...cfg.settings };
+  if (cfg.registration) set.registration = { email: String(cfg.registration.email || ''), password: String(cfg.registration.password || '') };
+  if (cfg.mailbox) set.mailbox = { ...(cur.mailbox || {}), ...cfg.mailbox };
   if (resumes.length) {
     set.resumes = resumes;
     set.defaultResumeId = cfg.defaultResume || resumes[0].id;
@@ -210,6 +297,60 @@ async function importBundledConfig() {
   return true;
 }
 
+
+const MAIL_NOTICE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAYElEQVR4nO3SSQoAIAhA0fYdtaN2qNqHkUMDwRfchOkTTLnU9jITAAAAAEiPp8IFiG7oBowNvIOlniaAFTKrCwM0A1b/tgBmh6qp3wrw3AQAAAD+ApwINeBmAgAA4DmgA825nKDH0YMmAAAAAElFTkSuQmCC';
+let mailWatchBusy = false;
+async function syncMailWatch() {
+  const { mailbox = {} } = await chrome.storage.local.get('mailbox');
+  if (mailbox.watchEnabled && mailbox.clientId && mailbox.email) {
+    if (!mailbox.watchStartedAt) { await chrome.storage.local.set({ mailbox: { ...mailbox, watchStartedAt: Date.now() } }); return; }
+    if (!(await chrome.alarms.get('mailWatch'))) await chrome.alarms.create('mailWatch', { delayInMinutes: 1, periodInMinutes: 5 });
+  } else { await chrome.alarms.clear('mailWatch'); await chrome.alarms.clear('mailWatchSoon'); }
+}
+async function mailWatchTick() {
+  if (mailWatchBusy) return { ok: false, error: '邮箱检查进行中，请稍后。' };
+  mailWatchBusy = true;
+  try {
+    const { mailbox = {}, mailWatch = {}, mailNoticeUrls = {} } = await chrome.storage.local.get(['mailbox', 'mailWatch', 'mailNoticeUrls']);
+    if (!mailbox.watchEnabled || !mailbox.email || !mailbox.clientId) return { ok: false, error: '请先连接 Outlook 并开启求职邮件跟踪。' };
+    if (!mailbox.watchStartedAt) { await chrome.storage.local.set({ mailbox: { ...mailbox, watchStartedAt: Date.now() } }); return { ok: false, error: '已开启跟踪，请稍后再检查。' }; }
+    const r = await callHost({ action: 'mailWatch', email: mailbox.email, archive: !!mailbox.autoArchive, startedAt: mailbox.watchStartedAt / 1000 }, 180000);
+    if (!r.ok) {
+      await chrome.storage.local.set({ mailWatch: { ...mailWatch, error: r.error || '邮箱检查失败', attemptedAt: Date.now() } });
+      if (mailWatch.error !== r.error) await chrome.notifications.create('mail:connection', { type: 'basic', iconUrl: MAIL_NOTICE_ICON, title: '求职邮箱跟踪需要处理', message: r.error || '请在插件设置中检查邮箱连接。' }).catch(() => {});
+      return r;
+    }
+    const delivered = mailWatch.email === mailbox.email ? (mailWatch.delivered || []) : [];
+    const alerts = (r.alerts || []).filter((x) => !delivered.includes(x.id));
+    const next = { email: mailbox.email, checkedAt: r.checkedAt * 1000, archived: r.archived || 0, history: r.history || [], delivered: [...delivered, ...alerts.map((x) => x.id)].slice(-5000), error: '' };
+    for (const item of alerts) mailNoticeUrls['mail:' + item.id] = item.url;
+    const urls = Object.fromEntries(Object.entries(mailNoticeUrls).slice(-150));
+    await chrome.storage.local.set({ mailWatch: next, mailNoticeUrls: urls });
+    if (alerts.length) {
+      await chrome.action.setBadgeBackgroundColor({ color: '#0b6bcb' });
+      await chrome.action.setBadgeText({ text: String(alerts.length) });
+      for (const item of alerts.slice(0, 3)) {
+        await chrome.notifications.create('mail:' + item.id, { type: 'basic', iconUrl: MAIL_NOTICE_ICON, title: item.kind === 'important' ? '求职邮件：需要行动' : '求职邮件：待你查看', message: item.subject || item.from || '收到新的招聘邮件，请打开 Outlook 查看。' }).catch(async () => { await chrome.storage.local.set({ mailWatch: { ...next, error: '系统未显示桌面通知；新邮件已保存在下方跟踪记录，工具栏也有提醒。' } }); });
+      }
+      if (alerts.length > 3) await chrome.notifications.create('mail:more', { type: 'basic', iconUrl: MAIL_NOTICE_ICON, title: '还有新的求职邮件', message: `另有 ${alerts.length - 3} 封邮件保留在收件箱，请查看插件里的跟踪记录。` }).catch(() => {});
+    }
+    if ((r.alerts || []).length) await callHost({ action: 'mailAck', email: mailbox.email, ids: r.alerts.map((x) => x.id) }, 15000);
+    if (r.hasMore || (r.alerts || []).length >= 50) await chrome.alarms.create('mailWatchSoon', { delayInMinutes: 0.5 });
+    return { ok: true, archived: next.archived, alerts: alerts.length, checkedAt: next.checkedAt };
+  } finally { mailWatchBusy = false; }
+}
+chrome.notifications?.onClicked.addListener(async (id) => {
+  if (!id.startsWith('mail:')) return;
+  const { mailNoticeUrls = {} } = await chrome.storage.local.get('mailNoticeUrls');
+  if (mailNoticeUrls[id]) await chrome.tabs.create({ url: mailNoticeUrls[id] });
+  else chrome.runtime.openOptionsPage();
+  await chrome.action.setBadgeText({ text: '' });
+  await chrome.notifications.clear(id);
+});
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mailWatch' || a.name === 'mailWatchSoon') mailWatchTick().catch(() => {}); });
+chrome.storage.onChanged.addListener((changes, area) => { if (area === 'local' && changes.mailbox) syncMailWatch().catch(() => {}); });
+chrome.runtime.onStartup.addListener(() => syncMailWatch().catch(() => {}));
+syncMailWatch().catch(() => {});
 
 const CDP_KEYS = { Enter: [13, 'Enter', '\r'], Tab: [9, 'Tab'], ArrowDown: [40, 'ArrowDown'], ArrowUp: [38, 'ArrowUp'], Escape: [27, 'Escape'], Backspace: [8, 'Backspace'] };
 async function trustedInput(tabId, steps) {
@@ -335,7 +476,8 @@ function callHost(payload, timeoutMs) {
 const QI = (id) => 'qi:' + id;
 const Q_DEFAULTS = { order: [], running: false, autoSubmit: true, maxParked: 12, timeoutMin: 30, concurrency: 5, note: '', preferHost: '', windowId: null, groupId: null };
 const Q_LOGIN_ATS = new Set(['workday', 'oracle', 'icims', 'successfactors', 'taleo', 'ukg', 'dayforce', 'cornerstone', 'avature', 'eightfold', 'adp']);
-const Q_PARK = new Set(['login', 'verify', 'captcha', 'ready']); // 要你在那个标签页里动手的：标签页留着
+const Q_PARK = new Set(['login', 'verify', 'captcha', 'ready', 'stuck', 'timeout', 'noform', 'error']); // 没投完就留着的（10-21 定的规矩：投完了再关）
+const aiCalls = new Map(); // 标签页 → 最近 10 分钟 AI 调用时间戳（防循环，见 onMessage 的 'ai'）
 let QC = null;
 
 async function qGet() {
@@ -450,6 +592,11 @@ async function qHello(tabId, urls = []) {
   return { item: { id: it.id, url: it.url, company: it.company, title: it.title, resume: it.resume, hops: it.hops || 0, status: it.status, need: it.need || '', submitAt: it.submitAt || 0 }, autoSubmit: !!Q.meta.autoSubmit };
 }
 
+async function qCloseQuiet(tabId) {
+  await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => { window.onbeforeunload = null; window.addEventListener('beforeunload', (e) => e.stopImmediatePropagation(), true); } }).catch(() => {});
+  await chrome.tabs.remove(tabId).catch(() => {});
+}
+
 async function qReport(tabId, m) {
   const out = await qTx(async (Q) => {
     const it = qFind(Q, tabId);
@@ -481,41 +628,43 @@ async function qReport(tabId, m) {
     }
     it.status = 'needs';
     it.need = st;
-    if (Q_PARK.has(st)) return { next: true, park: true }; // 标签页留着等你
-    const close = it.tabId;
-    it.tabId = null;
-    return { close, next: true };
+    return { next: true, park: true };
   });
-  if (out && out.close) setTimeout(() => chrome.tabs.remove(out.close).catch(() => {}), 2500);
+  if (out && out.close) setTimeout(() => qCloseQuiet(out.close), 2500);
   if (out && out.park) qUnemulate(tabId);
   if (out && out.resume) qEmulateFocus(tabId);
   if (out && out.next) setTimeout(qNext, 3000);
   return { ok: true };
 }
 
+const Q_UNDERGRAD_ONLY = (t) => /\bunder ?grad(uate)?s?\b/i.test(t || '') && !/\bgrad(uate)?s?\b|\bmasters?\b|\bmba\b|\bph\.?d\b|\bpost-?grad/i.test(String(t).replace(/\bunder ?grad(uate)?s?\b/gi, ''));
+
 async function qNext() {
   const picks = await qTx(async (Q) => {
     const M = Q.meta;
+    for (const x of Q.items) if ((x.status === 'pending' || (x.status === 'needs' && !x.tabId)) && Q_UNDERGRAD_ONLY(x.title)) Object.assign(x, { status: 'ineligible', need: '', note: '只招本科生（你在读硕士）：' + String(x.title).slice(0, 80), ended: Date.now() });
     if (!M.running) return [];
     const running = Q.items.filter((x) => x.status === 'running');
     const slots = Math.max(1, Math.min(10, Number(M.concurrency) || 1)) - running.length;
     if (slots <= 0) return [];
-    const parked = Q.items.filter((x) => x.tabId && (x.status === 'resumed' || (x.status === 'needs' && Q_PARK.has(x.need)))).length;
+    const parked = Q.items.filter((x) => x.tabId && x.status === 'needs' && Q_PARK.has(x.need)).length;
     if (parked >= M.maxParked) {
       M.running = false;
-      M.note = `有 ${parked} 个标签页在等你（登录 / 验证码 / 人机验证 / 等你点提交），先暂停。处理掉几个再点「开始」。`;
+      M.note = `有 ${parked} 个标签页在等你（登录 / 验证码 / 人机验证 / 等你点提交），先暂停。处理掉几个、或把「最多留几个标签页等你」调大，再点「开始」。`;
       return [];
     }
-    const blocked = new Set(Q.items.filter((x) => x.tabId && x.status === 'needs' && x.need === 'login').map((x) => x.host));
+    const blocked = new Set(Q.items.filter((x) => x.status === 'needs' && x.need === 'login').map((x) => x.host)); // 要登录的网站（标签页关了也算）：其他职位先不开
     const busy = new Set(running.filter((x) => Q_LOGIN_ATS.has(x.ats)).map((x) => x.host));
+    const serial = new Set(Q.items.filter((x) => x.tabId || x.status === 'running').map(qSerialKey).filter(Boolean));
     const out = [];
     for (let n = 0; n < slots; n++) {
-      const ok = (x) => x.status === 'pending' && !blocked.has(x.host) && !(Q_LOGIN_ATS.has(x.ats) && busy.has(x.host));
+      const ok = (x) => x.status === 'pending' && !blocked.has(x.host) && !(Q_LOGIN_ATS.has(x.ats) && busy.has(x.host)) && !(qSerialKey(x) && serial.has(qSerialKey(x)));
       const it = (M.preferHost && Q.items.find((x) => ok(x) && x.host === M.preferHost)) || Q.items.find(ok);
       if (!it) break;
       if (M.preferHost && it.host !== M.preferHost) M.preferHost = '';
       Object.assign(it, { status: 'running', started: Date.now(), progress: Date.now(), hops: 0, need: '', note: '', missing: [], tries: (it.tries || 0) + 1 });
       if (Q_LOGIN_ATS.has(it.ats)) busy.add(it.host);
+      if (qSerialKey(it)) serial.add(qSerialKey(it));
       out.push({ id: it.id, url: it.url, force: !!it.force });
     }
     if (!out.length && !running.length) {
@@ -537,10 +686,10 @@ async function qOpen(pick) {
     setTimeout(qNext, 500);
     return;
   }
+  let tabId;
   try {
     const M = (await qGet()).meta;
     let win = M.windowId ? await chrome.windows.get(M.windowId).catch(() => null) : null;
-    let tabId;
     if (win) {
       tabId = (await chrome.tabs.create({ windowId: win.id, url: 'about:blank', active: false })).id;
       if (M.groupId != null) await chrome.tabs.group({ groupId: M.groupId, tabIds: tabId }).catch(() => qTx((Q2) => { Q2.meta.groupId = null; }));
@@ -553,6 +702,12 @@ async function qOpen(pick) {
     await chrome.tabs.update(tabId, { url: pick.url });
     qEmulateFocus(tabId);
   } catch (e) {
+    if (/cannot be edited right now|dragging a tab/i.test(String(e))) {
+      if (tabId) chrome.tabs.remove(tabId).catch(() => {});
+      await setItem({ status: 'pending', need: '', note: '', tabId: null });
+      setTimeout(qNext, 5000);
+      return;
+    }
     await setItem({ status: 'needs', need: 'error', note: '打不开标签页：' + e, tabId: null });
     setTimeout(qNext, 3000);
   }
@@ -568,6 +723,12 @@ chrome.tabs.onCreated.addListener((tab) => {
     it.hops = (it.hops || 0) + 1;
     return tab.openerTabId;
   }).then((old) => { if (old) setTimeout(() => chrome.tabs.remove(old).catch(() => {}), 4000); }).catch(() => {});
+});
+
+const Q_ERRPAGE_RE = /^(隐私设置错误|privacy error|your connection is not private|您的连接不是私密连接|无法访问此网站|this site can.t be reached|该网页无法正常运作|this page isn.t working)$/i;
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (!info.title || !Q_ERRPAGE_RE.test(info.title.trim())) return;
+  qReport(tabId, { state: 'closed', note: '网站打不开（' + info.title.trim() + '）' }).catch(() => {});
 });
 
 chrome.tabs.onRemoved.addListener((tabId, info) => {
@@ -606,9 +767,7 @@ async function qTick() {
     const out = [];
     for (const it of Q2.items) {
       if ((it.status === 'running' || it.status === 'resumed') && now - (it.progress || it.started || now) > Q2.meta.timeoutMin * 60000) {
-        Object.assign(it, { status: 'needs', need: 'timeout', note: `${Q2.meta.timeoutMin} 分钟没有进展`, ended: now });
-        if (it.tabId) out.push(it.tabId);
-        it.tabId = null;
+        Object.assign(it, { status: 'needs', need: 'timeout', note: `${Q2.meta.timeoutMin} 分钟没有进展（标签页留着）`, ended: now });
       }
     }
     return out;
@@ -640,6 +799,15 @@ function qUrlCompany(u) {
     if (/rippling\.com$/.test(h) && seg[0]) return 'rippling:' + seg[0].toLowerCase();
     return '';
   } catch (_) { return ''; }
+}
+function qSerialKey(x) {
+  try {
+    const u = new URL(x.lastUrl || x.url);
+    const seg = u.pathname.split('/').filter(Boolean);
+    if (/(^|\.)ashbyhq\.com$/.test(u.hostname) && seg[0]) return 'ashby:' + seg[0].toLowerCase();
+  } catch (_) { /* ignore */ }
+  const co = String(x.company || '').toLowerCase().replace(/\b(company of america|corporation|corp|incorporated|inc|llc|l\.l\.c|ltd|limited|co|group|holdings?|the)\b\.?/g, ' ').replace(/[^a-z0-9]+/g, '');
+  return co ? 'co:' + co : '';
 }
 function qCompanyKeyer(items) {
   const parent = new Map();
@@ -745,11 +913,11 @@ async function qCmd(m, sender) {
     return qSummary();
   }
   if (c === 'retry') {
-    const needs = new Set(m.needs || ['stuck', 'timeout', 'error', 'closed', 'noform']);
+    const needs = new Set(m.needs || ['stuck', 'timeout', 'error', 'closed', 'noform', 'login', 'verify', 'captcha', 'ready']);
     const n = await qTx((Q) => {
       let k = 0;
       for (const it of Q.items) {
-        const forced = m.force && m.ids && m.ids.includes(it.id) && it.status === 'dup' && !it.tabId;
+        const forced = m.force && m.ids && m.ids.includes(it.id) && (it.status === 'dup' || it.status === 'ineligible') && !it.tabId; // ineligible：标错了的（Selective Treasury 是被串到别的职位才关的）
         if (!forced && (it.status !== 'needs' || it.tabId || !needs.has(it.need) || (m.ids && !m.ids.includes(it.id)) || (m.host && it.host !== m.host))) continue;
         Object.assign(it, { status: 'pending', need: '', note: '', ...(forced ? { force: true } : {}) });
         k++;
@@ -758,9 +926,49 @@ async function qCmd(m, sender) {
     });
     return { ...(await qSummary()), retried: n };
   }
+  if (c === 'ineligible') {
+    const tabs = await qTx((Q) => {
+      const t = [];
+      for (const it of Q.items) if ((m.ids || []).includes(it.id) && it.status !== 'running') { if (it.tabId) t.push(it.tabId); Object.assign(it, { status: 'ineligible', need: '', note: String(m.note || '不符合条件').slice(0, 200), ended: Date.now(), tabId: null }); }
+      return t;
+    });
+    for (const t of tabs) await qCloseQuiet(t);
+    return { ...(await qSummary()), closed: tabs };
+  }
+  if (c === 'rerun') {
+    const Q = await qGet();
+    const started = [];
+    for (const it of Q.items.filter((x) => x.tabId && (m.ids || []).includes(x.id))) {
+      const r = await chrome.tabs.sendMessage(it.tabId, { type: 'wdafStartAll' }).catch(() => null);
+      if (r && r.started) started.push(it.id);
+    }
+    return { ok: true, started };
+  }
+  if (c === 'acceptDialogs') {
+    const tabs = (await chrome.tabs.query({})).filter((t) => !m.tabId || t.id === m.tabId);
+    const done = [];
+    for (const t of tabs) {
+      const target = { tabId: t.id };
+      const held = qEmu.has(t.id);
+      try {
+        if (!held) await chrome.debugger.attach(target, '1.3');
+        await chrome.debugger.sendCommand(target, 'Page.handleJavaScriptDialog', { accept: true });
+        done.push(t.id);
+      } catch (_) { /* 这个页没有对话框 */ }
+      if (!held) { try { await chrome.debugger.detach(target); } catch (_) { /* 已断开 */ } }
+    }
+    return { ok: true, handled: done };
+  }
   if (c === 'log') {
     const { log = [] } = await chrome.storage.local.get('log');
     return { ok: true, log: log.slice(-(m.n || 30)).map((r) => ({ url: r.url, status: r.status, time: r.time, title: (r.title || '').slice(0, 80) })) };
+  }
+  if (c === 'unlog' && m.match) {
+    const re = new RegExp(m.match, 'i');
+    const { log = [] } = await chrome.storage.local.get('log');
+    const removed = log.filter((r) => re.test(String(r.url || '')) || re.test(String(r.title || '')));
+    await chrome.storage.local.set({ log: log.filter((r) => !removed.includes(r)) });
+    return { ok: true, removed: removed.map((r) => ({ url: String(r.url || '').slice(0, 120), status: r.status, time: r.time })) };
   }
   if (c === 'stop') {
     await qTx((Q) => { Q.meta.running = false; Q.meta.note = '已停止：正在投的放回待投了，点「开始」接着投'; });

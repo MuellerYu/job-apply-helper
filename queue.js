@@ -76,7 +76,7 @@ const ATS = [
   [/greenhouse\.io|grnh\.se/, 'greenhouse', 0], [/lever\.co/, 'lever', 0], [/ashbyhq\.com/, 'ashby', 0], [/smartrecruiters\.com/, 'smartrecruiters', 0],
   [/workable\.com/, 'workable', 0], [/paylocity\.com/, 'paylocity', 0], [/rippling\.com/, 'rippling', 0], [/pinpointhq\.com/, 'pinpoint', 0],
   [/applytojob\.com/, 'jazzhr', 0], [/bamboohr\.com/, 'bamboohr', 0], [/jobvite\.com/, 'jobvite', 1], [/paycomonline\.net/, 'paycom', 1],
-  [/myworkdayjobs\.com|myworkdaysite\.com/, 'workday', 2], [/oraclecloud\.com/, 'oracle', 2], [/icims\.com/, 'icims', 2], [/successfactors\.(com|eu)/, 'successfactors', 2],
+  [/myworkdayjobs\.com|myworkdaysite\.com/, 'workday', 2], [/oraclecloud\.com/, 'oracle', 2], [/icims\.com/, 'icims', 2], [/successfactors\.(com|eu)|sapsf\.(com|eu)/, 'successfactors', 2],
   [/taleo\.net/, 'taleo', 2], [/ultipro\.com|ukg\.net/, 'ukg', 2], [/dayforcehcm\.com/, 'dayforce', 2], [/csod\.com/, 'cornerstone', 2], [/avature\.net/, 'avature', 2],
   [/jobright\.ai|intern-list\.com|indeed\.com|linkedin\.com|glassdoor\.com|ziprecruiter\.com|simplify\.jobs/, 'aggregator', 3],
 ];
