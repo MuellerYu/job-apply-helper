@@ -2,11 +2,26 @@ chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'openOptions') chrome.runtime.openOptionsPage();
+  if (msg && msg.type === 'openVerifyLink' && sender.tab) {
+    (async () => {
+      let ok = false;
+      try {
+        const u = new URL(String(msg.url || '')), from = new URL(sender.url);
+        if (u.protocol === 'https:' && u.hostname === from.hostname && /\.myworkday(jobs|site)\.com$/i.test(u.hostname)) {
+          const t = await chrome.tabs.create({ url: u.href, active: false, windowId: sender.tab.windowId });
+          setTimeout(() => chrome.tabs.remove(t.id).catch(() => {}), 25000);
+          ok = true;
+        }
+      } catch (_) { /* 链接不合规就不开 */ }
+      sendResponse({ ok });
+    })();
+    return true;
+  }
   if (msg && msg.type === 'mailbox') {
     const ownOptions = sender.url === chrome.runtime.getURL('options.html');
     const action = msg.action;
     if (ownOptions && action === 'mailWatchNow') { mailWatchTick().then(sendResponse, () => sendResponse({ ok: false, error: '邮箱检查失败，请稍后再试。' })); return true; }
-    if (action === 'mailCode' && sender.tab) {
+    if ((action === 'mailCode' || action === 'mailLink') && sender.tab) {
       (async () => {
         const { mailbox = {} } = await chrome.storage.local.get('mailbox');
         if (!mailbox.enabled || !mailbox.email) return sendResponse({ ok: false, error: '请先在设置中连接并开启 Outlook 自动取码。' });
@@ -91,8 +106,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'queueHello' && sender && sender.tab) { if (!liveDoc) { sendResponse({ item: null }); return; } qHello(sender.tab.id, [sender.tab.url, sender.url]).then(sendResponse); return true; }
   if (msg && msg.type === 'queueReport' && sender && sender.tab) { if (!liveDoc) { sendResponse({ ok: false }); return; } qReport(sender.tab.id, msg).then(sendResponse, (e) => sendResponse({ ok: false, error: String(e) })); return true; }
   if (msg && msg.type === 'panelMark' && msg.kind === 'skip') {
-    const keys = new Set((msg.urls || []).filter((u) => /^https?:/.test(u || '')).map(qUrlKey));
-    qTx((Q) => { let n = 0; for (const it of Q.items) if (['pending', 'needs'].includes(it.status) && !it.tabId && (keys.has(qUrlKey(it.url)) || (it.lastUrl && keys.has(qUrlKey(it.lastUrl))))) { Object.assign(it, { status: 'skipped', need: '', note: '你在面板上点了「跳过这个」' }); n++; } return n; })
+    const keys = new Set((msg.urls || []).filter((u) => /^https?:/.test(u || '')).map(qJobKey).filter(Boolean));
+    qTx((Q) => { let n = 0; for (const it of Q.items) if (['pending', 'needs'].includes(it.status) && !it.tabId && (keys.has(qJobKey(it.url)) || (it.lastUrl && keys.has(qJobKey(it.lastUrl))))) { Object.assign(it, { status: 'skipped', need: '', note: '你在面板上点了「跳过这个」' }); n++; } return n; })
       .then((n) => sendResponse({ ok: true, n }), () => sendResponse({ ok: false }));
     return true;
   }
@@ -105,9 +120,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg && msg.type === 'jobDone') {
     (async () => {
-      const keys = new Set((msg.urls || []).filter((u) => /^https?:/.test(u || '')).map(qUrlKey));
+      const keys = new Set((msg.urls || []).filter((u) => /^https?:/.test(u || '')).map(qJobKey).filter(Boolean));
       const { log = [] } = await chrome.storage.local.get('log');
-      const r = log.find((x) => Q_DONE_LOG.test(x.status || '') && x.url && keys.has(qUrlKey(x.url)));
+      const r = log.find((x) => Q_DONE_LOG.test(x.status || '') && x.url && keys.has(qJobKey(x.url)));
       sendResponse(r ? { done: true, status: r.status, when: new Date(r.time || 0).toLocaleString('zh-CN', { hour12: false }) } : { done: false });
     })();
     return true;
@@ -126,10 +141,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg && msg.type === 'queueDoneByUrl' && sender && sender.tab) {
     (async () => {
-      const key = qUrlKey(String(msg.url || ''));
+      const key = qJobKey(String(msg.url || ''));
       let hit = null;
       await qTx((Q) => {
-        hit = Q.items.find((x) => x.status !== 'submitted' && (qUrlKey(x.url) === key || (x.lastUrl && qUrlKey(x.lastUrl) === key)));
+        hit = key ? Q.items.find((x) => x.status !== 'submitted' && (qJobKey(x.url) === key || (x.lastUrl && qJobKey(x.lastUrl) === key))) : null;
         if (hit) Object.assign(hit, { status: 'submitted', need: '', tabId: null, ended: Date.now(), note: '提交成功页（标签页之前跟队列断了，按职位网址找回）' });
       });
       if (hit) setTimeout(() => qCloseQuiet(sender.tab.id), 2500);
@@ -153,7 +168,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 chrome.runtime.onInstalled.addListener(async (details) => {
   await chrome.storage.local.set({ devBuildHash: await buildHash() }); // 记下这次加载的代码版本
   const imported = await importBundledConfig();
-  await injectIntoOpenTabs();
+  injectIntoOpenTabs().catch(() => {}); // 不等它装完：卡住的标签页不该拖住下面「重新打开队列页」（那里只认 15 秒内）
   if (details.reason === 'install' || (imported && details.reason !== 'update')) chrome.runtime.openOptionsPage();
   if (details.reason === 'update') {
     const { queuePageSeen: q } = await chrome.storage.local.get('queuePageSeen');
@@ -164,14 +179,15 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   }
 });
 
+const INJECT_FILES = ['defaults.js', 'content.js'];
+const qWithin = (p, ms) => new Promise((res) => { const t = setTimeout(() => res(null), ms); p.then((v) => { clearTimeout(t); res(v); }, () => { clearTimeout(t); res(null); }); });
+const injectTab = (tabId, ms) => qWithin(chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: INJECT_FILES }), ms).then((r) => !!r);
 async function injectIntoOpenTabs() {
   let tabs = [];
-  try { tabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] }); } catch (_) { return; }
-  for (const t of tabs) {
-    try {
-      await chrome.scripting.executeScript({ target: { tabId: t.id, allFrames: true }, files: ['defaults.js', 'content.js'] });
-    } catch (_) { /* 打不开的页面（商店、浏览器自带页面等）跳过 */ }
-  }
+  try { tabs = (await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] })).filter((t) => !t.discarded); } catch (_) { return; }
+  const ok = await Promise.all(tabs.map((t) => injectTab(t.id, 30000)));
+  const bad = tabs.filter((_, i) => !ok[i]);
+  if (bad.length) console.warn('[重载] 这些标签页没等到新脚本装完（卡住 / 打不开的页面）', bad.map((t) => t.id + ' ' + String(t.url || '').slice(0, 80)));
 }
 chrome.runtime.onStartup.addListener(importBundledConfig);
 chrome.runtime.onStartup.addListener(() => qTx((Q) => {
@@ -520,6 +536,35 @@ function qGhId(x) {
   return '';
 }
 
+const Q_ID_PARAMS = ['career_job_req_id', 'jobseqno', 'job_id', 'jobid', 'pid', 'tm_job', 'req', 'job', 'jid', 'pipelineid'];
+function qIdParam(x) {
+  const p = new Map();
+  for (const [k, v] of x.searchParams) if (v && !p.has(k.toLowerCase())) p.set(k.toLowerCase(), v);
+  let name = Q_ID_PARAMS.find((k) => p.has(k) && p.get(k).length <= 80);
+  if (!name && /(^|\.)adp\.com$/i.test(x.hostname) && p.has('r')) name = 'r'; // ADP：RTI.home?c=…&d=…&r=职位号
+  if (!name && /(^|\.)recruitingbypaycor\.com$/i.test(x.hostname) && p.has('id')) name = 'id'; // Paycor：JobIntroduction.action?id=职位号
+  if (!name) return '';
+  const co = /successfactors|sapsf/i.test(x.hostname) && p.get('company') ? '&company=' + p.get('company') : '';
+  return ('?' + name + '=' + p.get(name) + co).toLowerCase();
+}
+function qWdJob(x) {
+  const h = x.hostname.toLowerCase();
+  if (!/\.myworkday(jobs|site)\.com$/.test(h)) return '';
+  const seg = x.pathname.split('/').filter(Boolean);
+  const i = seg.findIndex((s) => /^(job|details)$/i.test(s));
+  if (i < 0) return '';
+  let rest = seg.slice(i + 1);
+  const a = rest.findIndex((s) => /^(apply|application)$/i.test(s));
+  if (a >= 0) rest = rest.slice(0, a);
+  let slug = rest[rest.length - 1] || '';
+  if (!slug) return '';
+  try { slug = decodeURIComponent(slug); } catch (_) { /* 原样用 */ }
+  const u = slug.lastIndexOf('_');
+  if (u >= 0) slug = slug.slice(0, u + 1) + slug.slice(u + 1).replace(/^(.*\d{3,})-\d{1,2}$/, '$1');
+  const r = seg.indexOf('recruiting');
+  const tenant = /^wd\d+\./.test(h) && r >= 0 && seg[r + 1] ? seg[r + 1] : h.split('.')[0];
+  return ('workday:' + tenant + ':' + slug).toLowerCase();
+}
 function qUrlKey(u) {
   try {
     const x = new URL(u);
@@ -527,42 +572,86 @@ function qUrlKey(u) {
     if (gh) return 'greenhouse:' + gh;
     const pl = /(^|\.)paylocity\.com$/i.test(x.hostname) && x.pathname.match(/\/jobs\/(?:apply|details)\/(\d+)/i);
     if (pl) return 'paylocity:' + pl[1];
-    return (x.hostname + x.pathname.replace(/^\/[a-z]{2}-[A-Z]{2}(?=\/)/, '').replace(/\/(confirmation|thank-?you|thanks|success|submitted|application-?complete)\/?$/i, '')
-      .replace(/\/(apply|application)(\/.*)?$/, '').replace(/\/$/, '')).toLowerCase();
+    const ora = /(^|\.)oraclecloud\.com$/i.test(x.hostname) && x.pathname.match(/\/CandidateExperience\/.*\/(?:job|requisitions\/preview)\/(\d+)(?:\/|$)/i);
+    if (ora) return 'oracle:' + x.hostname.toLowerCase() + ':' + ora[1];
+    const wd = qWdJob(x);
+    if (wd) return wd;
+    const path = x.pathname.replace(/^\/[a-z]{2}-[A-Z]{2}(?=\/)/, '').replace(/\/(confirmation|thank-?you|thanks|success|submitted|application-?complete|applythankyou)\/?$/i, '')
+      .replace(/\/(apply|application)(\/.*)?$/, '').replace(/\/$/, '')
+      .replace(/\/job\/[^/]+\/([^/]+)$/, (m, last) => (/\.myworkday(jobs|site)\.com$/i.test(x.hostname) ? '/job/' + last : m));
+    const id = /\d{4,}|[0-9a-f]{8}-[0-9a-f]{4}/i.test(path) ? '' : qIdParam(x);
+    return (x.hostname + path).toLowerCase() + id;
   } catch (_) { return String(u || '').toLowerCase(); }
+}
+const Q_GENERIC_KEY = new RegExp([
+  '^[^/]+(/[a-z]{2}([_-][a-z]{2})?|/[a-z]{2,6}/[a-z]{2})?(/(careers?|portalcareer|jobs|search|talentcommunity|index\\.cfm|home|candidate-experience))?$',
+  '/(jobtasks/completed|my-profile|userhome|login|sign[_-]?in|logout)$',
+  '^[^/]+\\.myworkday(jobs|site)\\.com(/recruiting/[^/]+)?/[^/]+$',
+  '/candidateexperience/.*/sites/[^/]+(/jobs)?$',
+  '/embed/job_app$', '/apply_flow/', '\\.action$', '/flow\\.jsf$', '/authsvc\\b',
+].join('|'));
+function qJobKey(u) {
+  const k = qUrlKey(u);
+  if (!k) return null;
+  if (/^(greenhouse|paylocity|oracle|workday):/.test(k) || k.includes('?') || /\.applytojob\.com$/.test(k)) return k;
+  return Q_GENERIC_KEY.test(k) ? null : k;
 }
 
 const qFind = (Q, tabId) => Q.items.find((x) => x.tabId === tabId && ['running', 'resumed', 'needs'].includes(x.status));
 
 const Q_DONE_LOG = /已提交|已点提交/;
+const Q_CONFIRMED_LOG = /已提交/; // 见过成功页或你标记的。「已点提交」不含这三个字
+const Q_CLICKED_NOTE = '点了提交，没见到成功页，等你确认';
 async function qAlreadyDone(Q, it, urls) {
-  const keys = new Set(urls.filter((u) => /^https?:/.test(u || '')).map(qUrlKey).filter(Boolean));
+  const keys = new Set(urls.filter((u) => /^https?:/.test(u || '')).map(qJobKey).filter(Boolean));
   if (!keys.size) return '';
   const { log = [] } = await chrome.storage.local.get('log');
-  if (log.some((r) => Q_DONE_LOG.test(r.status || '') && (r.time || 0) < (it.started || Date.now()) && keys.has(qUrlKey(r.url)))) return '投递记录里已提交过（跳转后认出）';
+  const hits = log.filter((r) => Q_DONE_LOG.test(r.status || '') && (r.time || 0) < (it.started || Date.now()) && keys.has(qJobKey(r.url)));
+  if (hits.length) return hits.some((r) => Q_CONFIRMED_LOG.test(r.status)) ? '投递记录里已提交过（跳转后认出）' : Q_CLICKED_NOTE;
   for (const x of Q.items) {
     if (x.id === it.id) continue;
-    const same = (x.url && keys.has(qUrlKey(x.url))) || (x.lastUrl && /^(greenhouse|paylocity):/.test(qUrlKey(x.lastUrl)) && keys.has(qUrlKey(x.lastUrl)));
+    const same = (x.url && keys.has(qJobKey(x.url))) || (x.lastUrl && /^(greenhouse|paylocity|oracle|workday):/.test(qUrlKey(x.lastUrl)) && keys.has(qJobKey(x.lastUrl)));
     if (!same) continue;
-    if (x.status === 'submitted' || x.status === 'dup') return '队列里同一个职位已经投过（跳转后认出）';
+    if (x.status === 'submitted' || x.status === 'dup' || x.status === 'unconfirmed') return '队列里同一个职位已经投过（跳转后认出）';
     if (x.tabId && ['running', 'resumed', 'needs'].includes(x.status)) return '另一个标签页在投同一个职位';
   }
   return '';
 }
 
+async function qConfirmLog(ids) {
+  const Q = await qGet();
+  const keys = new Set(Q.items.filter((x) => ids.includes(x.id) && (x.status === 'submitted' || x.status === 'dup')).flatMap((x) => [qJobKey(x.url), x.lastUrl && qJobKey(x.lastUrl)]).filter(Boolean));
+  if (!keys.size) return 0;
+  const { log = [] } = await chrome.storage.local.get('log');
+  let n = 0;
+  for (const r of log) if (r.status === '已点提交' && r.url && keys.has(qJobKey(r.url))) { r.status = '已提交（你确认）'; n++; }
+  if (n) await chrome.storage.local.set({ log });
+  return n;
+}
 async function qSyncFromLog() {
   const { log = [] } = await chrome.storage.local.get('log');
   const done = new Map();
-  for (const r of log) if (Q_DONE_LOG.test(r.status || '') && r.url) done.set(qUrlKey(r.url), r);
+  for (const r of log) {
+    if (!Q_DONE_LOG.test(r.status || '') || !r.url) continue;
+    const k = qJobKey(r.url);
+    if (!k) continue; // 认不出职位的记录（成功页、登录页）不拿来对队列
+    if (!done.has(k) || Q_CONFIRMED_LOG.test(r.status) || !Q_CONFIRMED_LOG.test(done.get(k).status)) done.set(k, r);
+  }
   if (!done.size) return 0;
   return qTx((Q) => {
     let n = 0;
+    const counted = new Map();
+    for (const x of Q.items) if (x.status === 'submitted' || x.status === 'dup') { const k = qJobKey(x.url); if (k && !counted.has(k)) counted.set(k, x.id); }
     for (const it of Q.items) {
-      if (!['pending', 'needs', 'stuck'].includes(it.status) || it.force) continue;
+      if (!['pending', 'needs', 'stuck', 'unconfirmed'].includes(it.status) || it.force) continue;
       if (it.tabId && it.status === 'needs') continue; // 队列自己开着的标签页在等你，交了它自己会回报
-      const r = done.get(qUrlKey(it.url)) || (it.lastUrl && done.get(qUrlKey(it.lastUrl)));
+      const r = done.get(qJobKey(it.url)) || (it.lastUrl && done.get(qJobKey(it.lastUrl)));
       if (!r) continue;
-      Object.assign(it, { status: 'submitted', note: '队列外提交（' + r.status + '）', ended: r.time || Date.now() });
+      const sure = Q_CONFIRMED_LOG.test(r.status);
+      if (!sure && it.status === 'unconfirmed') continue;
+      const k0 = qJobKey(it.url);
+      if (sure && k0 && counted.has(k0) && counted.get(k0) !== it.id) { Object.assign(it, { status: 'dup', need: '', note: '同一个职位另一条链接已投过（换了链接）', ended: r.time || Date.now() }); n++; continue; }
+      Object.assign(it, sure ? { status: 'submitted', note: '队列外提交（' + r.status + '）', ended: r.time || Date.now() } : { status: 'unconfirmed', need: '', note: Q_CLICKED_NOTE, ended: r.time || Date.now() });
       n++;
     }
     return n;
@@ -576,6 +665,35 @@ chrome.storage.onChanged.addListener((ch, area) => {
 });
 setTimeout(() => qSyncFromLog().catch(() => {}), 3000);
 
+const Q_WALL = new Set(['login', 'verify', 'captcha']);
+const Q_AGG_HOST = /(^|\.)(linkedin\.com|indeed\.com|glassdoor\.com|ziprecruiter\.com|simplify\.jobs|grnh\.se|prng\.co|vansh\.nyc|jobright\.ai|intern-list\.com)$/;
+function qSiteKey(u) {
+  try {
+    const x = new URL(u);
+    const h = x.hostname.toLowerCase();
+    if (/\.myworkday(jobs|site)\.com$/.test(h)) {
+      const seg = x.pathname.split('/').filter(Boolean);
+      const r = seg.indexOf('recruiting');
+      return 'wd:' + (/^wd\d+\./.test(h) && r >= 0 && seg[r + 1] ? seg[r + 1].toLowerCase() : h.split('.')[0]);
+    }
+    return h;
+  } catch (_) { return ''; }
+}
+function qHomeSite(x) {
+  const a = x.url ? qSiteKey(x.url) : '';
+  const b = x.lastUrl ? qSiteKey(x.lastUrl) : '';
+  return b && Q_AGG_HOST.test(a) ? b : a;
+}
+const Q_SHARED_ATS = /(^|\.)(greenhouse\.io|lever\.co|ashbyhq\.com|smartrecruiters\.com|workable\.com|paycomonline\.(net|com)|successfactors\.(com|eu)|sapsf\.(com|eu)|adp\.com|ultipro\.com|dayforcehcm\.com|rippling\.com|icims\.com)$/;
+const qWallKeys = (x) => {
+  const h = qHomeSite(x);
+  if (Q_AGG_HOST.test(h)) return [h];
+  return [...new Set([Q_SHARED_ATS.test(h) ? '' : h, qSerialKey(x)].filter(Boolean))];
+};
+const qCandKeys = (x) => [...new Set([x.url ? qSiteKey(x.url) : '', qHomeSite(x), qSerialKey(x)].filter(Boolean))];
+function qWallSet(Q, it, need, now) { const W = Q.meta.walls = Q.meta.walls || {}; it.wallKeys = qWallKeys(it); for (const k of it.wallKeys) W[k] = { need, t: now }; }
+function qWallClear(Q, it) { const W = Q.meta.walls; if (W) for (const k of [...(it.wallKeys || []), ...qWallKeys(it)]) delete W[k]; delete it.wallKeys; }
+
 async function qHello(tabId, urls = []) {
   const Q = await qGet();
   const it = qFind(Q, tabId);
@@ -583,7 +701,7 @@ async function qHello(tabId, urls = []) {
   if (it.status === 'running' && !it.submitAt && !it.force) {
     const why = await qAlreadyDone(Q, it, urls);
     if (why) {
-      await qTx((Q2) => { const x = Q2.items.find((y) => y.id === it.id); if (x) Object.assign(x, { status: 'dup', note: why, ended: Date.now(), tabId: null }); });
+      await qTx((Q2) => { const x = Q2.items.find((y) => y.id === it.id); if (x) Object.assign(x, { status: why === Q_CLICKED_NOTE ? 'unconfirmed' : 'dup', note: why, ended: Date.now(), tabId: null }); });
       setTimeout(() => chrome.tabs.remove(tabId).catch(() => {}), 800);
       setTimeout(qNext, 2000);
       return { item: null };
@@ -607,7 +725,8 @@ async function qReport(tabId, m) {
     if (m.url) it.lastUrl = String(m.url).slice(0, 500);
     if (st === 'progress') {
       if (it.status === 'needs') {
-        if (it.need === 'login') Q.meta.preferHost = it.host;
+        if (it.need === 'login') { const ph = qHomeSite(it) || it.host; if (!Q_AGG_HOST.test(ph)) Q.meta.preferHost = ph; }
+        it.prevNeed = it.need;
         it.status = 'resumed';
         it.need = '';
         return { next: true, resume: true };
@@ -615,19 +734,21 @@ async function qReport(tabId, m) {
       return null;
     }
     if (st === 'hop') { it.hops = (it.hops || 0) + 1; return null; }
-    if (st === 'submitting') { it.submitAt = now; return null; } // 点了提交：跳到新页面后靠它认出「这是提交成功页」
+    if (st === 'submitting') { it.submitAt = now; qWallClear(Q, it); return null; } // 点了提交：跳到新页面后靠它认出「这是提交成功页」
     it.note = String(m.note || '').slice(0, 400);
     if (Array.isArray(m.missing)) it.missing = m.missing.slice(0, 8).map((s) => String(s).slice(0, 80));
     it.ended = now;
     if (st === 'submitted' || st === 'dup' || st === 'closed' || st === 'ineligible' || st === 'skipped') { // skipped：你在面板上点了「跳过这个」
       it.status = st;
       it.need = '';
+      if (st === 'submitted') qWallClear(Q, it);
       const close = it.tabId;
       it.tabId = null;
       return { close, next: true };
     }
     it.status = 'needs';
     it.need = st;
+    if (Q_WALL.has(st)) qWallSet(Q, it, st, now);
     return { next: true, park: true };
   });
   if (out && out.close) setTimeout(() => qCloseQuiet(out.close), 2500);
@@ -644,24 +765,28 @@ async function qNext() {
     const M = Q.meta;
     for (const x of Q.items) if ((x.status === 'pending' || (x.status === 'needs' && !x.tabId)) && Q_UNDERGRAD_ONLY(x.title)) Object.assign(x, { status: 'ineligible', need: '', note: '只招本科生（你在读硕士）：' + String(x.title).slice(0, 80), ended: Date.now() });
     if (!M.running) return [];
-    const running = Q.items.filter((x) => x.status === 'running');
+    const running = Q.items.filter((x) => x.status === 'running' || (x.status === 'resumed' && x.tabId));
     const slots = Math.max(1, Math.min(10, Number(M.concurrency) || 1)) - running.length;
     if (slots <= 0) return [];
     const parked = Q.items.filter((x) => x.tabId && x.status === 'needs' && Q_PARK.has(x.need)).length;
     if (parked >= M.maxParked) {
-      M.running = false;
-      M.note = `有 ${parked} 个标签页在等你（登录 / 验证码 / 人机验证 / 等你点提交），先暂停。处理掉几个、或把「最多留几个标签页等你」调大，再点「开始」。`;
+      if (!running.length && !Q.items.some((x) => x.status === 'pending')) { M.running = false; M.note = `队列跑完了（还有 ${parked} 个标签页在等你）`; return []; }
+      M.note = `有 ${parked} 个标签页在等你（登录 / 验证码 / 人机验证 / 等你点提交），先不开新的。处理掉一个，队列自己接着投，不用再点「开始」；也可以把「最多留几个标签页等你」调大。`;
       return [];
     }
-    const blocked = new Set(Q.items.filter((x) => x.status === 'needs' && x.need === 'login').map((x) => x.host)); // 要登录的网站（标签页关了也算）：其他职位先不开
+    const blocked = new Set(Q.items.filter((x) => x.status === 'needs' && x.tabId && Q_WALL.has(x.need)).flatMap(qWallKeys));
+    const walls = M.walls || {};
     const busy = new Set(running.filter((x) => Q_LOGIN_ATS.has(x.ats)).map((x) => x.host));
     const serial = new Set(Q.items.filter((x) => x.tabId || x.status === 'running').map(qSerialKey).filter(Boolean));
     const out = [];
     for (let n = 0; n < slots; n++) {
-      const ok = (x) => x.status === 'pending' && !blocked.has(x.host) && !(Q_LOGIN_ATS.has(x.ats) && busy.has(x.host)) && !(qSerialKey(x) && serial.has(qSerialKey(x)));
-      const it = (M.preferHost && Q.items.find((x) => ok(x) && x.host === M.preferHost)) || Q.items.find(ok);
+      const ok = (x) => x.status === 'pending' && (x.soon || !qCandKeys(x).some((k) => blocked.has(k))) && !(Q_LOGIN_ATS.has(x.ats) && busy.has(x.host)) && !(qSerialKey(x) && serial.has(qSerialKey(x)));
+      const hard = (x) => !x.soon && ((x.tries || 0) >= 2 || qCandKeys(x).some((k) => walls[k]));
+      const pref = (x) => !!M.preferHost && (x.host === M.preferHost || qCandKeys(x).includes(M.preferHost));
+      const it = Q.items.find((x) => ok(x) && pref(x)) || Q.items.find((x) => ok(x) && !hard(x)) || Q.items.find(ok);
       if (!it) break;
-      if (M.preferHost && it.host !== M.preferHost) M.preferHost = '';
+      if (M.preferHost && !pref(it) && !Q.items.some((x) => x.status === 'pending' && pref(x))) M.preferHost = '';
+      delete it.soon;
       Object.assign(it, { status: 'running', started: Date.now(), progress: Date.now(), hops: 0, need: '', note: '', missing: [], tries: (it.tries || 0) + 1 });
       if (Q_LOGIN_ATS.has(it.ats)) busy.add(it.host);
       if (qSerialKey(it)) serial.add(qSerialKey(it));
@@ -669,9 +794,9 @@ async function qNext() {
     }
     if (!out.length && !running.length) {
       const left = Q.items.some((x) => x.status === 'pending');
-      M.note = left ? '剩下的职位都在等你登录对应的网站（见「等你处理」）' : '队列跑完了';
+      M.note = left ? '剩下的职位都被「等你处理」里同网站 / 同公司的页挡着（登录 / 验证码 / 人机验证 / 卡住的页）：处理掉，或点「重试卡住的」' : '队列跑完了';
       if (!left) M.running = false;
-    } else if (out.length) M.note = '';
+    } else if (out.length || /先不开新的/.test(M.note)) M.note = '';
     return out;
   });
   for (const pick of picks) await qOpen(pick);
@@ -680,9 +805,10 @@ async function qNext() {
 async function qOpen(pick) {
   const setItem = (patch) => qTx((Q) => { const it = Q.items.find((x) => x.id === pick.id); if (it) Object.assign(it, patch); });
   const { log = [] } = await chrome.storage.local.get('log');
-  const key = qUrlKey(pick.url);
-  if (!pick.force && log.some((r) => Q_DONE_LOG.test(r.status || '') && qUrlKey(r.url) === key)) {
-    await setItem({ status: 'dup', note: '投递记录里已提交过', ended: Date.now() });
+  const key = qJobKey(pick.url);
+  const doneRecs = key ? log.filter((r) => Q_DONE_LOG.test(r.status || '') && qJobKey(r.url) === key) : [];
+  if (!pick.force && doneRecs.length) {
+    await setItem(doneRecs.some((r) => Q_CONFIRMED_LOG.test(r.status)) ? { status: 'dup', note: '投递记录里已提交过', ended: Date.now() } : { status: 'unconfirmed', note: Q_CLICKED_NOTE, ended: Date.now() });
     setTimeout(qNext, 500);
     return;
   }
@@ -766,6 +892,8 @@ async function qTick() {
     const now = Date.now();
     const out = [];
     for (const it of Q2.items) {
+      if (it.status === 'resumed' && it.tabId && now - (it.progress || 0) > 180000) { Object.assign(it, { status: 'needs', need: it.prevNeed || 'stuck', ended: now }); continue; }
+      if (it.status === 'running' && !it.tabId && now - (it.started || 0) > 90000) { Object.assign(it, { status: 'pending', need: '', tries: Math.max(0, (it.tries || 1) - 1) }); continue; }
       if ((it.status === 'running' || it.status === 'resumed') && now - (it.progress || it.started || now) > Q2.meta.timeoutMin * 60000) {
         Object.assign(it, { status: 'needs', need: 'timeout', note: `${Q2.meta.timeoutMin} 分钟没有进展（标签页留着）`, ended: now });
       }
@@ -827,23 +955,23 @@ async function qImport(data) {
   }
   const rows = (data.items || []).filter((r) => r && r.id && r.url);
   const { log = [] } = await chrome.storage.local.get('log');
-  const doneKeys = new Map(log.filter((r) => /已提交|已填到|已点提交/.test(r.status || '')).map((r) => [qUrlKey(r.url), r.status]));
+  const doneKeys = new Map(log.filter((r) => /已提交|已填到|已点提交/.test(r.status || '')).map((r) => [qJobKey(r.url), r.status]).filter((e) => e[0]));
   const res = await qTx((Q) => {
     const by = new Map(Q.items.map((x) => [x.id, x]));
     const out = [];
     const fresh = new Set();
     let added = 0;
-    const seenKey = new Map(Q.items.filter((x) => x.status !== 'pending').map((x) => [qUrlKey(x.url), x.status]));
+    const seenKey = new Map(Q.items.filter((x) => x.status !== 'pending' && x.status !== 'closed').map((x) => [qJobKey(x.url), x.status]).filter((e) => e[0]));
     for (const r of rows) {
-      const k = qUrlKey(r.url);
+      const k = qJobKey(r.url);
       const old = by.get(r.id);
-      if (seenKey.has(k) && !(old && old.status !== 'pending')) continue;
-      seenKey.set(k, 'pending');
+      if (k && seenKey.has(k) && !(old && old.status !== 'pending')) continue;
+      if (k) seenKey.set(k, 'pending');
       if (old) { Object.assign(old, { url: r.url, company: r.company, title: r.title, loc: r.loc, resume: r.resume, prio: r.prio, ats: r.ats, host: r.host }); out.push(old); by.delete(r.id); }
       else {
-        const was = doneKeys.get(k);
+        const was = k ? doneKeys.get(k) : undefined;
         const unsupported = !was && Q_UNSUPPORTED.test(String(r.url || '') + ' ' + String(r.ats || ''));
-        out.push({ ...r, status: was ? 'dup' : unsupported ? 'skipped' : 'pending', note: was ? '投递记录：' + was : unsupported ? '插件暂不支持这个招聘系统（SmartRecruiters 新版申请页）' : '' });
+        out.push({ ...r, status: was ? (/^已点提交/.test(was) ? 'unconfirmed' : 'dup') : unsupported ? 'skipped' : 'pending', note: was ? '投递记录：' + was : unsupported ? '插件暂不支持这个招聘系统（SmartRecruiters 新版申请页）' : '' });
         fresh.add(r.id);
         added++;
       }
@@ -855,7 +983,15 @@ async function qImport(data) {
     if (cap) {
       const ck = qCompanyKeyer(out);
       const used = {};
-      for (const x of out) if (x.status !== 'pending' && x.status !== 'skipped') used[ck(x)] = (used[ck(x)] || 0) + 1;
+      const occupies = (x) => !['pending', 'skipped', 'closed'].includes(x.status) && !(x.status === 'ineligible' && !/投过/.test(x.note || ''));
+      const usedJobs = new Set();
+      for (const x of out) {
+        if (!occupies(x)) continue;
+        const u = ck(x) + '|' + (qJobKey(x.url) || 'id:' + x.id);
+        if (usedJobs.has(u)) continue;
+        usedJobs.add(u);
+        used[ck(x)] = (used[ck(x)] || 0) + 1;
+      }
       const keep = new Set();
       for (const x of out.filter((y) => y.status === 'pending').sort((a, b) => (b.prio || 0) - (a.prio || 0))) {
         const k = ck(x);
@@ -891,8 +1027,9 @@ async function qSummary(full) {
     active: active ? slim(active) : null,
     actives: actives.map(slim),
     needs: needs.slice(0, full ? 5000 : 300).map(slim),
-    done: full ? Q.items.filter((x) => ['submitted', 'dup', 'closed', 'skipped'].includes(x.status)).map(slim) : undefined,
+    done: full ? Q.items.filter((x) => ['submitted', 'unconfirmed', 'dup', 'closed', 'skipped'].includes(x.status)).map(slim) : undefined,
     pending: full ? Q.items.filter((x) => x.status === 'pending').map(slim) : undefined,
+    ineligible: full ? Q.items.filter((x) => x.status === 'ineligible').map(slim) : undefined,
   };
 }
 
@@ -917,9 +1054,9 @@ async function qCmd(m, sender) {
     const n = await qTx((Q) => {
       let k = 0;
       for (const it of Q.items) {
-        const forced = m.force && m.ids && m.ids.includes(it.id) && (it.status === 'dup' || it.status === 'ineligible') && !it.tabId; // ineligible：标错了的（Selective Treasury 是被串到别的职位才关的）
+        const forced = m.force && m.ids && m.ids.includes(it.id) && (it.status === 'dup' || it.status === 'ineligible' || it.status === 'closed' || it.status === 'unconfirmed') && !it.tabId; // ineligible：标错了的（Selective Treasury 是被串到别的职位才关的）
         if (!forced && (it.status !== 'needs' || it.tabId || !needs.has(it.need) || (m.ids && !m.ids.includes(it.id)) || (m.host && it.host !== m.host))) continue;
-        Object.assign(it, { status: 'pending', need: '', note: '', ...(forced ? { force: true } : {}) });
+        Object.assign(it, { status: 'pending', need: '', note: '', ...(forced ? { force: true } : {}), ...(m.ids ? { soon: true } : {}) });
         k++;
       }
       return k;
@@ -938,11 +1075,20 @@ async function qCmd(m, sender) {
   if (c === 'rerun') {
     const Q = await qGet();
     const started = [];
-    for (const it of Q.items.filter((x) => x.tabId && (m.ids || []).includes(x.id))) {
-      const r = await chrome.tabs.sendMessage(it.tabId, { type: 'wdafStartAll' }).catch(() => null);
+    const injected = []; // 顶层没有活着的脚本、这次补装上了的
+    const dead = [];     // 补装后还是没人应的（页面卡死 / 打不开）：要你刷新或先点掉对话框（acceptDialogs）
+    const ask = (tabId) => qWithin(chrome.tabs.sendMessage(tabId, { type: 'wdafStartAll' }, { frameId: 0 }), 5000);
+    await Promise.all(Q.items.filter((x) => x.tabId && (m.ids || []).includes(x.id)).map(async (it) => {
+      let r = await ask(it.tabId);
+      if (!r) {
+        await injectTab(it.tabId, 8000);
+        await new Promise((res) => setTimeout(res, 2500));
+        r = await ask(it.tabId);
+        (r ? injected : dead).push(it.id);
+      }
       if (r && r.started) started.push(it.id);
-    }
-    return { ok: true, started };
+    }));
+    return { ok: true, started, injected, dead };
   }
   if (c === 'acceptDialogs') {
     const tabs = (await chrome.tabs.query({})).filter((t) => !m.tabId || t.id === m.tabId);
@@ -990,8 +1136,49 @@ async function qCmd(m, sender) {
     return { ...(await qSummary()), changed: n };
     
   }
+  if (c === 'adopt' && m.id && m.tabId) {
+    await qTx((Q) => { const it = Q.items.find((x) => x.id === m.id); if (it) Object.assign(it, { tabId: m.tabId, status: 'running', need: '', note: '' }); });
+    return qSummary();
+  }
+  if (c === 'front' && Array.isArray(m.ids)) {
+    const pos = new Map(m.ids.map((id, i) => [id, i]));
+    let n = 0;
+    await qTx((Q) => {
+      const head = Q.items.filter((x) => pos.has(x.id)).sort((a, b) => pos.get(a.id) - pos.get(b.id));
+      n = head.length;
+      Q.items = [...head, ...Q.items.filter((x) => !pos.has(x.id))];
+    });
+    return { ...(await qSummary()), changed: n };
+  }
+  if (c === 'unconfirm') {
+    const n = await qTx((Q) => {
+      let k = 0;
+      for (const it of Q.items) {
+        if (!(it.status === 'submitted' && /已点提交/.test(it.note || '')) && !(it.status === 'dup' && (m.ids || []).includes(it.id))) continue;
+        it.status = 'unconfirmed';
+        k++;
+      }
+      return k;
+    });
+    return { ...(await qSummary()), changed: n };
+  }
   if (c === 'submitted') {
     await qTx((Q) => { for (const it of Q.items) if ((m.ids || []).includes(it.id) && it.status !== 'running') Object.assign(it, { status: 'submitted', need: '', note: m.note || '你确认已提交', ended: it.ended || Date.now(), tabId: null }); });
+    await qConfirmLog(m.ids || []);
+    return qSummary();
+  }
+  if (c === 'dup') {
+    await qTx((Q) => { for (const it of Q.items) if ((m.ids || []).includes(it.id) && (it.status === 'unconfirmed' || (it.status === 'pending' && !it.tabId))) Object.assign(it, { status: 'dup', need: '', note: m.note || '同一个职位另一条已提交', ended: it.ended || Date.now(), tabId: null }); });
+    await qConfirmLog(m.ids || []);
+    return qSummary();
+  }
+  if (c === 'wall' || c === 'unwall') {
+    await qTx((Q) => {
+      if (c === 'unwall' && !m.keys && !m.ids) { Q.meta.walls = {}; return; }
+      const W = Q.meta.walls = Q.meta.walls || {};
+      for (const k of m.keys || []) { const key = String(k).toLowerCase(); if (c === 'wall') W[key] = { need: m.need || 'login', t: Date.now() }; else delete W[key]; }
+      for (const it of Q.items) if ((m.ids || []).includes(it.id)) { if (c === 'wall') qWallSet(Q, it, m.need || 'login', Date.now()); else qWallClear(Q, it); }
+    });
     return qSummary();
   }
   if (c === 'focus' && m.id) {

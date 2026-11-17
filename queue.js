@@ -1,7 +1,7 @@
 const $ = (s) => document.querySelector(s);
 const cmd = (c, extra) => new Promise((r) => chrome.runtime.sendMessage({ type: 'queueCmd', cmd: c, ...(extra || {}) }, (x) => { void chrome.runtime.lastError; r(x || {}); }));
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const LABEL = { pending: '待投', running: '正在投', resumed: '你处理后继续中', submitted: '已提交', dup: '已投过', closed: '职位已关', skipped: '跳过' };
+const LABEL = { pending: '待投', running: '正在投', resumed: '你处理后继续中', submitted: '已提交', unconfirmed: '待确认', dup: '已投过', closed: '职位已关', skipped: '跳过' };
 const NEED = { login: '要登录 / 注册', verify: '要邮箱验证码', captcha: '要人机验证', ready: '等你点提交', stuck: '卡住了', timeout: '超时', error: '出错', closed: '标签页被关了', noform: '找不到申请表' };
 
 async function refresh() {
@@ -9,7 +9,7 @@ async function refresh() {
   if (!s.ok) return;
   const c = s.count || {};
   const needTotal = Object.entries(c).filter(([k]) => k.startsWith('needs:')).reduce((a, [, v]) => a + v, 0);
-  const cards = [['总数', s.total], ['待投', c.pending || 0], ['已提交', c.submitted || 0], ['等你处理', needTotal], ['已投过', c.dup || 0], ['职位已关', c.closed || 0], ['跳过', c.skipped || 0]];
+  const cards = [['总数', s.total], ['待投', c.pending || 0], ['已提交', c.submitted || 0], ['待确认', c.unconfirmed || 0], ['等你处理', needTotal], ['已投过', c.dup || 0], ['职位已关', c.closed || 0], ['不符合 / 不投', c.ineligible || 0], ['跳过', c.skipped || 0]];
   for (const [k, v] of Object.entries(c)) if (k.startsWith('needs:')) cards.push([NEED[k.slice(6)] || k, v]);
   $('#stats').innerHTML = cards.map(([k, v]) => `<div class="stat"><b>${v}</b><span>${esc(k)}</span></div>`).join('');
   $('#note').hidden = !s.meta.note;
@@ -29,6 +29,8 @@ async function refresh() {
       <td><span class="tag">${esc(it.status === 'resumed' ? LABEL.resumed : NEED[it.need] || it.need)}</span><div class="why">${esc(it.note || '')}${it.missing && it.missing.length ? '<br>缺：' + esc(it.missing.join('；')) : ''}</div></td>
       <td><button data-a="focus">去处理</button><button data-a="retry" class="ghost">重试</button><button data-a="skip" class="ghost">跳过</button></td>
     </tr>`).join('') : '<tr><td class="hint">没有</td></tr>';
+  const unconfirmed = (s.done || []).filter((x) => x.status === 'unconfirmed').sort((a, b) => (b.prio || 0) - (a.prio || 0));
+  $('#unconfirmed').innerHTML = unconfirmed.length ? unconfirmed.map((it) => `<tr data-id="${esc(it.id)}"><td><a href="${esc(it.url)}" target="_blank">${esc(it.company)} — ${esc(it.title)}</a><div class="why">${esc(it.prio)} 分${it.ended ? ' · ' + esc(new Date(it.ended).toLocaleString()) : ''}</div></td><td><button data-a="confirm">确认交了</button><button data-a="redo" class="ghost">放回重投</button></td></tr>`).join('') : '<tr><td class="hint">没有</td></tr>';
   const done = (s.done || []).filter((x) => x.status === 'submitted').sort((a, b) => (b.ended || 0) - (a.ended || 0)).slice(0, 200);
   $('#done').innerHTML = done.length ? done.map((it) => `<tr><td><a href="${esc(it.url)}" target="_blank">${esc(it.company)} — ${esc(it.title)}</a></td><td class="why">${it.ended ? new Date(it.ended).toLocaleString() : ''}</td></tr>`).join('') : '<tr><td class="hint">还没有</td></tr>';
 }
@@ -40,6 +42,14 @@ $('#needs').addEventListener('click', async (e) => {
   if (b.dataset.a === 'focus') await cmd('focus', { id });
   if (b.dataset.a === 'retry') await cmd('retry', { ids: [id], needs: Object.keys(NEED) });
   if (b.dataset.a === 'skip') await cmd('skip', { ids: [id] });
+  refresh();
+});
+$('#unconfirmed').addEventListener('click', async (e) => {
+  const b = e.target.closest('button[data-a]');
+  if (!b) return;
+  const id = b.closest('tr').dataset.id;
+  if (b.dataset.a === 'confirm') await cmd('submitted', { ids: [id] });
+  if (b.dataset.a === 'redo') await cmd('retry', { ids: [id], force: true });
   refresh();
 });
 $('#start').onclick = async () => { await cmd('start'); refresh(); };

@@ -11,7 +11,7 @@
   const AUTO_KEY = 'wdaf-auto-running';
   const USER_STOP_KEY = 'wdaf-user-stopped';
   const userStopped = () => { try { return !!sessionStorage.getItem(USER_STOP_KEY); } catch (_) { return false; } };
-  const BUILD = '2026-10-22.448'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
+  const BUILD = '2026-11-16.487'; // 每次改代码都改这里：面板上 data-build 能看出浏览器里跑的是哪一版
   let QUEUE = null;
   try { if (/\/(job|jobs|apply|application|careers?)\b/i.test(location.pathname) && !/\/jobTasks\/completed\//i.test(location.pathname)) sessionStorage.setItem('wdaf-lastJob', location.href.split('#')[0]); } catch (_) { /* ignore */ }
   let QUEUE_SUBMIT = false; // 队列设置：填完自动提交
@@ -50,6 +50,15 @@
     try { sessionStorage.setItem(wdLocaleKey, '1'); } catch (_) { /* 无痕等情况存不了，也只是多跳一次 */ }
     console.log('[自动投递] Workday 页面是', WD_LOCALE[1], '版，换成英文版网址');
     location.replace(location.pathname.replace(/^\/[a-z]{2}-[A-Z]{2}/, '/en-US') + location.search + location.hash);
+  }
+  const EF_PAGE = /^\/careers\/(job|apply)\b/.test(location.pathname) && (/(^|\.)eightfold\.ai$/i.test(location.hostname) || !!q('script[src*="vscdn.net"]'));
+  const efKey = 'wdaf-en:' + location.pathname + location.search.replace(/[?&]hl=[^&]*/, '');
+  if (EF_PAGE && !/^en/i.test(document.documentElement.lang || '') && new URLSearchParams(location.search).get('hl') !== 'en' && !sessionStorage.getItem(efKey)) {
+    try { sessionStorage.setItem(efKey, '1'); } catch (_) { /* 存不了也只是多跳一次 */ }
+    const u = new URL(location.href);
+    u.searchParams.set('hl', 'en');
+    console.log('[自动投递] Eightfold 页面是', document.documentElement.lang, '版，换成英文版网址');
+    location.replace(u.href);
   }
   const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[’‘]/g, "'").replace(/[ \s]+/g, ' ').replace(/[*✱]/g, '').trim();
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -183,8 +192,21 @@
     renderPanel();
   }
 
+  const logUrlNow = () => location.href.split('#')[0].replace(/\/(confirmation|thank-?you|thanks|success)\/?(\?.*)?$/i, '').replace(/\/apply(\/.*)?$/, '');
+  const SUBMIT_CLICK_KEY = 'wdaf-submitClick';
+  function submitClickSave() {
+    try { sessionStorage.setItem(SUBMIT_CLICK_KEY, JSON.stringify({ t: Date.now(), url: logUrlNow(), title: String(jobTitleFromPage() || document.title).slice(0, 200) })); } catch (_) { /* ignore */ }
+  }
+  function submitClickGet(maxMs) {
+    try { const c = JSON.parse(sessionStorage.getItem(SUBMIT_CLICK_KEY) || 'null'); return c && c.url && Date.now() - c.t < (maxMs || 20 * 60000) ? c : null; } catch (_) { return null; }
+  }
+  const joblessPage = () => /\/jobTasks\/completed\//i.test(location.pathname) || !/\/(jobs?|apply|applications?|positions?|requisitions?)(\/|$)/i.test(location.pathname);
+
   async function addLog(status) {
-    const url = location.href.split('#')[0].replace(/\/(confirmation|thank-?you|thanks|success)\/?(\?.*)?$/i, '').replace(/\/apply(\/.*)?$/, '');
+    let url = logUrlNow();
+    const click = /^已提交/.test(status) ? submitClickGet() : null;
+    const onClick = !!(click && click.url !== url && joblessPage());
+    if (onClick) url = click.url;
     const { log = [] } = await chrome.storage.local.get('log');
     const pick = currentPick || (await chooseResume());
     const entry = {
@@ -196,8 +218,9 @@
       status,
     };
     const i = log.findIndex((r) => r.url === url);
-    if (i >= 0) log[i] = { ...log[i], ...entry };
-    else log.push(entry);
+    if (i >= 0) log[i] = onClick ? { ...log[i], time: entry.time, status } : { ...log[i], ...entry };
+    else log.push(onClick ? { ...entry, title: click.title || entry.title } : entry);
+    if (click || status === '提交被拒') { try { sessionStorage.removeItem(SUBMIT_CLICK_KEY); } catch (_) { /* ignore */ } }
     if (status === '提交被拒') {
       const base = (u) => String(u || '').replace(/\/applications(\/new)?\/?$/, '');
       for (const r of log) if (r !== log[i] && r.status === '已点提交' && base(r.url) === base(url)) r.status = '提交被拒';
@@ -475,6 +498,10 @@
         if (l) { cands.push(textOf(l)); break; }
       }
     }
+    if (!isChoice && !cands.length && fs && qa('input, select, textarea', fs).filter((c) => c.type !== 'hidden' && isVisible(c)).length > 1) {
+      const lbt = String(el.getAttribute('aria-labelledby') || '').split(/\s+/).filter((id) => id && !/-error$/.test(id)).map((id) => textOf(document.getElementById(id))).join(' ').trim();
+      if (lbt) cands.push(lbt);
+    }
     if (fs && !/^[a-z]+[A-Z][\w$]*(\.[\w$]+)*$|^[\w$]+\.[\w$.]+$/.test(textOf(q('legend', fs)))) cands.push(textOf(q('legend', fs)));
     const ff = el.closest('[data-automation-id^="formField"]');
     if (ff) {
@@ -577,6 +604,10 @@
   const TOOL_KINDS = [...PICK, 'radio', 'checkgroup', 'text']; // 「用过哪些编程工具」：多选框组、下拉、文本框都可能
   const SOURCE_RE = /how did you (first )?(hear|learn|find|come across)|where did you (first )?(hear|learn|find|see)|^source\b|referral source|recruiting source|candidate source/;
   const SMS_OK_RE = /^(?!.*(marketing|promotional|newsletter|talent (community|network|pool)|job alerts?)).*(opt[- ]?in (for|to) (receive )?(texts?|sms|text messages?)\b|select ['"“]?yes['"”]? to opt-?in|opt-?in or ['"“]?no['"”]? to opt-?out|^text consent|consent to (receive )?(text|sms|automated call)|(receive|get) (communications?|messages?|notifications?|updates?|texts?|alerts?) (via|by|through|over) (sms|text|whatsapp)|\b(sms|whatsapp)\b.{0,60}(communications?|messages?|notifications?|updates?|alerts?|opt-?in|consent))/;
+  const SPONSOR_FUTURE = String.raw`future|eventually|at any (point|time)|any time|long[- ]term|beyond|post[- ]graduat\w*|after (you )?(graduat\w*|complet\w*|finish\w*)|after (the |this |your )?(internship|program|studies|degree|opt|graduation)|upon (completion|graduation)|full[- ]time|permanent\w*|going forward|subsequent\w*|later|ever|extend\w*|continu\w*|renew\w*|h-?1b|now or|or will|or would|f-?1|cpt|opt|stem`;
+  const SPONSOR_NOW = String.raw`(do|does|are) you (currently |presently |now )?(\w+ ){0,3}(require|need)|currently|presently|at (this|the present) time|at present|right now|this (internship|position|role|opportunity|job|program)|(for|during) (the|this|your) (summer|internship|position|role)|internship`;
+  const SPONSOR_NOW_RE = new RegExp(String.raw`^(?!.*\b(${SPONSOR_FUTURE})\b)(?!.*without).*(sponsor.*\b(${SPONSOR_NOW})\b|\b(${SPONSOR_NOW})\b.*sponsor)`);
+  const AUTH_NOW_RE = new RegExp(String.raw`^(?!.*\b(${SPONSOR_FUTURE}|any employer|indefinite\w*|unrestrict\w*|restrictions?|limitations?)\b).*without (\w+ ){0,4}sponsor`);
   const RULES = [
     { re: /^(phone )?extension$|phone extension|^ext\.?$/, key: null },
     { re: /interested in hearing about (new |other |future )?(opportunit|position|job)|weekly email|job alerts?|subscribe|newsletter|talent (community|network|pool)|notify me of new/, key: null },
@@ -609,7 +640,7 @@
     { re: /^location( \(city\))?$|^current (city|location)|city of residence|where are you (currently )?(located|based)/, key: 'cityLoc', kinds: [...PICK, 'text'], self: true },
     { re: /^city|\btown\b/, key: 'city', kinds: [...TEXT, 'combo'], self: true },
     { re: /postal|\bzip\b/, key: 'postalCode', kinds: [...TEXT, 'combo'], self: true },
-    { re: /^(state|province|region|administrative area|省|州)/, key: 'state', kinds: [...PICK, 'text'], self: true }, // Paylocity 地址栏叫「Administrative Area」
+    { re: /^(?:(state|province|region|administrative area)\b|省|州)/, key: 'state', kinds: [...PICK, 'text'], self: true }, // Paylocity 地址栏叫「Administrative Area」
     { re: /^country/, key: 'country', kinds: [...PICK, 'text'], first: true, self: true },
     { re: /sponsorship needs|what (type|kind) of (visa |work )?(sponsorship|authori[sz]ation)|(current|your) (immigration|visa) (status|type|category)|describe your (visa|immigration|sponsorship)/, key: null, kinds: TEXT },
     { re: /(first )?hear(d)? (about|of) (this|the) (job|position|role|opening|opportunity) online|^did you .{0,40}\bonline\b/, key: 'YES', kinds: [...PICK, 'radio'] },
@@ -620,6 +651,8 @@
     { re: /^(?!.*\b(future|now or|eventually|at any (point|time))\b).*((\bimmediately\b|within (the (next|first) )?(three|3) months|upon hire|at the time of hire).{0,80}sponsor|sponsor.{0,60}(\bimmediately\b|within (the (next|first) )?(three|3) months))/, key: 'sponsorSoon', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /(currently|presently|now) (being )?sponsored|sponsored by (another|a different|your current|a current|an?) (company|employer)|(current|existing) (employer )?sponsorship (from|by|with)/, key: 'currentlySponsored', kinds: [...PICK, 'radio'] },
     { re: /^hours? (per|a|each) week$|^weekly hours$|^hours ?\/ ?week$|^hrs ?(per|\/) ?(week|wk)$/, key: 'hoursPerWeek', kinds: ['text'] },
+    { re: SPONSOR_NOW_RE, key: 'sponsorNow', kinds: [...PICK, 'radio', 'checkgroup'] },
+    { re: AUTH_NOW_RE, key: 'AUTH_NOW', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /^(?!.*without).*\b(require|requires|need|needs)\b (\w+ ){0,3}(visa )?sponsor/, key: 'needSponsorship', kinds: [...PICK, 'radio', 'checkgroup'] },
     { re: /(hold|have) .{0,40}practical training|currently (hold|have|on) (an? )?opt\b|\bopt\b (status|ead) (currently|now)/, key: 'hasOPT', kinds: [...PICK, 'radio'] },
     { re: /used (any )?(portion|part) of .{0,60}(optional practical training|\bopt\b)|(have|has) used (your |any )?(opt|optional practical training)\b/, key: 'hasOPT', kinds: [...PICK, 'radio'] },
@@ -727,7 +760,7 @@
     { re: /gpa|grade point|overall result/, key: 'gpa', kinds: [...TEXT, ...PICK] },
     { re: /languages? (fluency|proficiency)|languages? .{0,60}(fluen|business-level|proficien)|which languages/, key: 'languageList', kinds: [...PICK, 'checkgroup'] },
     { re: /(come|work) (in|into|from) (the |our )?office|in[- ]office .{0,30}days|\d(-|–| to )\d days (per|a) week|days (per|a) week .{0,40}office/, key: 'inOffice' },
-    { re: /earliest (availability|start|date)|availab\w* to (start|begin)|^start date$|when (can|could) you start|desired start date|how soon (are you|can you|could you|would you be) (available|able) to start/, key: 'availableStart', kinds: [...TEXT, 'date'] },
+    { re: /earliest (availability|start|date)|availab\w* to (start|begin)|^start date$|when (can|could) you start|desired start date|how soon (are you|can you|could you|would you be) (available|able) to start|available for (full[- ]?time )?(employment|work)\b|how (long|soon) after [^?]{0,40}offer[^?]{0,80}\b(start|begin|join|joining)\b(?! (date )?(salary|pay|rate))/, key: 'availableStart', kinds: [...TEXT, 'date'] },
     { re: /^(second|2nd|additional|double|secondary) (major|field of study)|^minor\b/, key: null }, // Jane Street：Secondary Major / Field of study
     { re: /^(?!.*\bgpa\b)(?!.*(disabilit|major life|chronic|impairment)).*(field of study|\bmajor\b|discipline|area of study)/, key: 'fieldOfStudy' },
     { re: /(programming|software|statistical|coding) (tools?|languages?|packages?|software)\b.{0,160}\b(outside|beyond|independent|internship|thesis|research assistant|work experience|professional)/, key: 'toolsWork', kinds: TOOL_KINDS },
@@ -737,6 +770,7 @@
     { re: /pronoun/, key: 'pronouns', kinds: PICK },
     { re: /^(what is your )?gender\b/, key: 'gender' },
     { re: /^(are you|do you (identify|consider yourself) as)( a)? (hispanic|latino)|^(?!.*(\brace\b|ethnic)).*(hispanic|latino)/, key: 'hispanic' },
+    { re: /(choose|wish|prefer|elect) not to (disclose|self[- ]?identify|identify|answer|provide)\b.{0,40}(race|ethnic)/, key: 'NO', kinds: [...PICK, 'radio'] },
     { re: /\braces?\b|ethnicity|ethnic/, key: 'ethnicity' }, // 「Select the races you identify with」（Navy Federal）是复数
     { re: /sexual orientation/, key: 'sexualOrientation' },
     { re: /transgender/, key: 'transgender', kinds: [...PICK, 'radio'] },
@@ -744,7 +778,7 @@
     { re: /gender|^sex$/, key: 'gender' },
     { re: /(military|armed forces|service ?members?).{0,80}spouses?|disclose your (military|veteran|service) status/, key: 'NONE_ABOVE', kinds: ['checkgroup', 'radio', ...PICK] },
     { re: /military spouse|spouse .{0,40}(military|armed forces|service ?member)/, key: 'militarySpouse' },
-    { re: /veteran|military/, key: 'veteran' },
+    { re: /^(?!.*\bdischarge\b.{0,12}\b(date|month|day|year)\b)(?=.*(veteran|military))/, key: 'veteran' },
     { re: /interview.{0,120}\b(require|need|request)\b.{0,40}(travel|lodging|hotel|reimburse|assistance)|(travel|lodging) (assistance|reimbursement).{0,60}interview/, key: 'interviewTravelAssist', kinds: [...PICK, 'radio'] },
     { re: /(involuntarily )?(terminated|fired|dismissed|discharged|let go|suspended)\b.{0,30}\b(from|by) (any |a |your )?(previous |prior |past |former )?(employ|job|position|employer|work)|asked to resign|resign in lieu of/, key: 'everTerminated', kinds: [...PICK, 'radio'] },
     { re: /(planned|plan to take|anticipate|scheduled) .{0,30}(time off|vacation|leave|absence)|time off .{0,40}(during|throughout) (the )?(\d+[- ]week )?(internship|program|summer)/, key: 'plannedTimeOff', kinds: [...PICK, 'radio'] },
@@ -797,6 +831,8 @@
     if (key === 'noMiddleName') return P.middleName ? '' : 'CHECK';
     if (key === 'preferredNameYN') return P.preferredName && P.preferredOnlyIfRequired !== 'Yes' ? 'Yes' : 'No';
     if (key === 'AUTH_NO_SPONSOR') return P.needSponsorship === 'Yes' ? 'No' : P.workAuthorized;
+    if (key === 'sponsorNow') return P.sponsorNow || P.needSponsorship; // 资料没填就跟「要不要担保」一样
+    if (key === 'AUTH_NOW') return (P.sponsorNow || P.needSponsorship) === 'Yes' ? 'No' : P.workAuthorized;
     if (key === 'sponsorSoon') return P.sponsorSoon || P.needSponsorship; // 资料没填就跟「要不要担保」一样
     if (key === 'hoursPerWeek') return String(P.hoursPerWeek || 40);
     if (key === 'skills') return P.skills ? P.skills.split(/[,，;；]/).map((s) => s.trim()).filter(Boolean) : '';
@@ -1060,7 +1096,7 @@
 
   const EDU_KEYS = new Set(['school', 'degree', 'fieldOfStudy', 'gpa']);
   const ADDRESS_KEYS = new Set(['address1', 'address2', 'city', 'state', 'postalCode', 'cityLoc']);
-  const VISA_KEYS = new Set(['AUTH_NO_SPONSOR', 'workAuthorized', 'needSponsorship', 'currentlySponsored']);
+  const VISA_KEYS = new Set(['AUTH_NO_SPONSOR', 'AUTH_NOW', 'workAuthorized', 'needSponsorship', 'sponsorNow', 'currentlySponsored']);
   const CHOICE_KINDS = new Set(['radio', 'select', 'combo', 'listbox', 'popcombo']);
 
 
@@ -1562,7 +1598,7 @@
     if (f.ui5 && f.kind !== 'checkbox' && f.kind !== 'radio') return f.kind === 'ui5sel' ? !ui5SelText(f.el) || /^(not selected|select|please select|-+)$/i.test(ui5SelText(f.el)) : !ui5Val(f.ui5);
     switch (f.kind) {
       case 'text': case 'date': return !f.el.value.trim() && !tagChips(f.el).length;
-      case 'combo': return (f.srAc ? !srAcPicked(f) : !comboValue(f.el)) || siteSaysRequired(f.el);
+      case 'combo': if (f.el.classList.contains('typeahead-control') && addListCount(f.el) > 0) return false; return (f.srAc ? !srAcPicked(f) : !comboValue(f.el)) || siteSaysRequired(f.el);
       case 'select': return f.s2 ? select2Empty(f.s2) : (!f.el.value || !f.el.selectedOptions.length || isPlaceholderOpt(f.el.selectedOptions[0]));
       case 'listbox': return /^(select one|select|-{1,3}|)$/i.test(lbText(f.el)); // Paylocity react-widgets 没选时显示「--」
       case 'popcombo': return POP_EMPTY_RE.test(popText(f.el));
@@ -1582,6 +1618,7 @@
     const fields = collectFields();
     for (const e of qa('div, span, p, small, li, [role="alert"]')) {
       if (e.children.length > 1 || !isVisible(e) || e.closest('#wdaf-host') || e.closest(SR_ONLY) || !REQ_ERR_RE.test(textOf(e))) continue;
+      if (/marked with|indicates? that|\* ?(indicates?|denotes?)|asterisk/i.test(textOf(e))) continue;
       let box = e.parentElement;
       for (let i = 0; i < 6 && box; i++, box = box.parentElement) {
         const file = q('input[type="file"]', box);
@@ -1966,8 +2003,48 @@
   }
 
   const trustedTried = new WeakSet(); // 已经用真实键鼠试过的下拉
+  function addListBox(input) {
+    let box = input;
+    for (let i = 0; i < 8 && box; i++) {
+      box = box.parentElement;
+      if (box && box.querySelector('button.add-button')) return box;
+    }
+    return null;
+  }
+  function addListCount(input) {
+    let sect = addListBox(input);
+    for (let i = 0; i < 6 && sect && !sect.querySelector('li.multigroup-item'); i++) sect = sect.parentElement;
+    return sect ? sect.querySelectorAll('li.multigroup-item').length : 0;
+  }
+  async function fillAddList(input, cands) {
+    const box = addListBox(input);
+    const addBtn = box && box.querySelector('button.add-button');
+    if (!addBtn) return false;
+    const items = String(cands[0] || '').split(/\s*[,;，、]\s*/).map((t) => t.trim()).filter((t) => t && t.length <= 40).slice(0, 6);
+    if (!items.length) return false;
+    let sect = box;
+    for (let i = 0; i < 6 && sect && ![...sect.querySelectorAll('button')].some((b) => /^(保存|save)$/i.test(b.innerText.trim())); i++) sect = sect.parentElement;
+    sect = sect || box;
+    const have = () => textOf(sect).toLowerCase();
+    let added = 0;
+    for (const item of items) {
+      if (have().includes(item.toLowerCase())) continue;
+      if (!(await trustedType(input, item, false))) setNative(input, item);
+      await sleep(600);
+      if (addBtn.disabled) continue;
+      addBtn.click();
+      added++;
+      await sleep(600);
+    }
+    const save = [...sect.querySelectorAll('button')].find((b) => /^(保存|save)$/i.test(b.innerText.trim()) && isVisible(b));
+    if (save && added) { save.click(); await sleep(1000); }
+    dbg('技能逐项添加', items, '加了', added);
+    return added > 0 || items.every((t) => have().includes(t.toLowerCase()));
+  }
+
   async function fillCombo(input, cands, ans) {
     if (!running) return false;
+    if (input.classList.contains('typeahead-control') && await fillAddList(input, cands)) return true;
     const opts = await openCombo(input);
     if (opts.length) {
       const big = opts.length >= 90 || (opts.length >= 50 && !!(input.id && document.getElementById(input.id + '-dropdown-list-container')));
@@ -1976,6 +2053,10 @@
       if (!hit && ans && /^(workAuthorized|AUTH_NO_SPONSOR|needSponsorship|sponsorship)$/.test(ans.key || '') && S.profile.needSponsorship === 'Yes') {
         const req = opts.filter((o) => /requir\w*\b(\W+\w+){0,4}\W+sponsor/i.test(o.text) && !/\b(not|n't|never|no|without)\b(\W+\w+){0,3}\W+(requir|need|sponsor)/i.test(o.text));
         if (req.length === 1) hit = req[0];
+      }
+      if (!hit && ans && ans.key === 'sponsorNow' && /^no$/i.test(String(ans.value || ''))) {
+        const noReq = opts.filter((o) => /\b(not|n't|never|no|without)\b(\W+\w+){0,4}\W+(requir|need|sponsor)/i.test(o.text) && !/future|eventually|at any (point|time)/i.test(o.text));
+        if (noReq.length === 1) hit = noReq[0];
       }
       if (!hit && ans && ans.key === 'startMonth' && S.profile.availableStart) {
         const want = new Date(S.profile.availableStart).getMonth();
@@ -2057,8 +2138,8 @@
       if (/first|from|start/.test(label)) return { month: P.eduStartMonth, year: P.eduStartYear };
       if (/last|^to\b|end|graduat|expected/.test(label)) return { month: P.eduEndMonth, day: GRAD_DAY, year: P.eduEndYear };
     }
-    if (/graduat|(complete|finish|completion of) (all |your |the )*(degree|program|studies)|eligible to (begin|start) (an )?(entry[- ]level )?full[- ]time/.test(label)) return { month: P.eduEndMonth, day: GRAD_DAY, year: P.eduEndYear };
-    if (P.availableStart && /(desired|earliest|preferred|available|availability|possible) (start|starting)( date)?|start date|date (you are |you're )?available|when (can|could) you start|availab\w* (to|for) (start|begin|commence)|when (would|will|can|could) you (be able to |be available to )?(start|begin)|start(ing)? availability/.test(label)) {
+    if (/graduat|(complete|finish|completion of) (all |your |the )*(degree|program|studies)|eligible to (begin|start) (an )?(entry[- ]level )?full[- ]time|meet\w* (the )?educational requirements/.test(label)) return { month: P.eduEndMonth, day: GRAD_DAY, year: P.eduEndYear };
+    if (P.availableStart && /available for (full[- ]?time )?(employment|work)\b|(desired|earliest|preferred|available|availability|possible) (start|starting)( date)?|start date|date (you are |you're )?available|when (can|could) you start|availab\w* (to|for) (start|begin|commence)|when (would|will|can|could) you (be able to |be available to )?(start|begin)|start(ing)? availability|how (long|soon) after [^?]{0,40}offer[^?]{0,80}\b(start|begin|join|joining)\b(?! (date )?(salary|pay|rate))/.test(label)) {
       const d = new Date(P.availableStart);
       if (!isNaN(d)) return { month: d.getMonth() + 1, day: d.getDate(), year: d.getFullYear() };
     }
@@ -2230,9 +2311,12 @@
     return { key: 'AGREE', value: alts[0], alts };
   }
 
+  const ackBase = (el) => choiceLabel(el).trim().replace(/^\(required\)\s*/i, '');
+  const ackOwn = (el) => ackBase(el).replace(/^[*✱\s]+/, '').replace(/^\(required\)\s*/i, '').replace(/^yes\s*[,.:;–-]?\s*(?=i\b)/i, '');
+  const ackOptIn = (el) => ackOwn(el) !== ackBase(el) && (SUBSCRIBE_RE.test(norm(choiceLabel(el))) || MARKETING_CB_RE.test(choiceLabel(el)));
   function ackAnswer(f) {
     if (!S.settings.acceptTerms) return null;
-    if (f.kind === 'checkbox') return /^(i have read|i acknowledge|i understand|acknowledged|understood|i consent|i agree|i accept|(you|i) declare that (you|i) (have )?read|i hereby (grant|give|authori[sz]e|consent|certify|acknowledge|agree)|allow us to (process|store|use|hold) (your|my) (personal )?(information|data))\b/i.test(choiceLabel(f.el).trim().replace(/^\(required\)\s*/i, '')) && !/marketing|newsletter|promotional|talent (community|network|pool)|job alert|text message|\bsms\b|whatsapp|future (job )?(opportunit|openings)/i.test(choiceLabel(f.el) + ' ' + (f.question.length <= 200 ? f.question : '')) ? { value: 'CHECK' } : null; // 题目是一大段声明时（Paycom 签名区：声明里提到 future employment…）只看勾选框自己的字
+    if (f.kind === 'checkbox') return /^(i have read|i acknowledge|i understand|acknowledged|understood|i consent|i agree|i accept|(you|i) declare that (you|i) (have )?read|i hereby (grant|give|authori[sz]e|consent|certify|acknowledge|agree)|allow us to (process|store|use|hold) (your|my) (personal )?(information|data))\b/i.test(ackOwn(f.el)) && !ackOptIn(f.el) && !/marketing|newsletter|promotional|talent (community|network|pool)|job alert|text message|\bsms\b|whatsapp|future (job )?(opportunit|openings)/i.test(choiceLabel(f.el) + ' ' + (f.question.length <= 200 ? f.question : '')) ? { value: 'CHECK' } : null; // 题目是一大段声明时（Paycom 签名区：声明里提到 future employment…）只看勾选框自己的字
     if (f.kind === 'checkgroup' && f.els.length === 1) { const t = choiceLabel(f.els[0]); return /^(i have read|i acknowledge|i understand|acknowledged|understood)\b/i.test(t.trim()) ? { value: t } : null; }
     if (f.kind === 'checkgroup') {
       const acks = f.els.map(choiceLabel).map((t) => String(t || '').trim()).filter((t) => /^(i have read|i acknowledge|i hereby (acknowledge|certify|agree|attest)|i certify|i understand and agree)\b/i.test(t) && !/marketing|newsletter|text message|\bsms\b|job alert/i.test(t));
@@ -2518,6 +2602,27 @@
 
   const uploadedInputs = new WeakSet();
   const uploadedZones = new Set(); // 已经传过简历的栏（小节标题 + 上传框名字）
+  const UPLOAD_MAX = { resume: 3 };
+  const uploadCountKey = (kind) => 'wdaf-upn|' + kind + '|' + ((QUEUE && QUEUE.id) || location.hostname + jobKey());
+  function pageHasFileName(name) {
+    const want = String(name || '').toLowerCase();
+    if (!want) return false;
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      if (/^(SCRIPT|STYLE|NOSCRIPT)$/.test(n.parentNode.nodeName)) continue;
+      if (n.nodeValue.toLowerCase().includes(want)) return true;
+    }
+    return false;
+  }
+  function uploadAllowed(kind, fileName) {
+    if (pageHasFileName(fileName)) return false;
+    let n = 0;
+    try { n = Number(sessionStorage.getItem(uploadCountKey(kind))) || 0; } catch (_) { /* ignore */ }
+    return n < (UPLOAD_MAX[kind] || 2);
+  }
+  function uploadCounted(kind) {
+    try { const k = uploadCountKey(kind); sessionStorage.setItem(k, String((Number(sessionStorage.getItem(k)) || 0) + 1)); } catch (_) { /* ignore */ }
+  }
 
   function fileAnchor(input) {
     if (!input.classList || !input.classList.contains('dz-hidden-input')) return input;
@@ -2556,6 +2661,7 @@
     return false;
   }
 
+  const inChatWidget = (i) => !!i.closest('.oda-chat-wrapper, .oda-chat-widget, [class*="chat-widget" i], [class*="chatbot" i], [id*="chatbot" i]');
   function resumeInputs() {
     if (isSfXweb()) {
       const ups = ui5All().filter((h) => ui5Tag(h) === 'file-uploader' && h.shadowRoot && isVisible(h)).map((h) => ({ h, i: h.shadowRoot.querySelector('input[type="file"]') })).filter((x) => x.i && !x.i.disabled);
@@ -2564,7 +2670,7 @@
       return (res.length ? res : ups.length === 1 ? ups : []).map((x) => x.i);
     }
     const ctx = fileCtxOwn;
-    const raw = [...qa('input[type="file"]'), ...(isSR() ? shadowQa('input[type="file"]') : [])].filter((i) => !i.disabled && !i.closest('#wdaf-host') && !/^pdfViewer_/i.test(i.id || ''));
+    const raw = [...qa('input[type="file"]'), ...(isSR() ? shadowQa('input[type="file"]') : [])].filter((i) => !i.disabled && !i.closest('#wdaf-host') && !inChatWidget(i) && !/^pdfViewer_/i.test(i.id || ''));
     const real = raw.filter((i) => !inAutofillZone(i));
     const all = real.length ? real : raw;
     const byName = all.filter((i) => /(^|[^a-z])(cv|resume)([^a-z]|$)/i.test(i.name || i.id || '') && !/cover|letter|transcript/i.test(i.name || i.id || ''));
@@ -2583,7 +2689,7 @@
     const T = S.transcript;
     if (!T || !T.data) return false;
     let n = 0;
-    const inputs = qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host'))
+    const inputs = qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host') && !inChatWidget(i))
       .filter((i) => { const own = norm([i.getAttribute('aria-label'), ...String(i.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => textOf(document.getElementById(id))), ...[...(i.labels || [])].map(textOf)].join(' ')); if (/transcript/.test(own) && !/resume|\bcv\b|cover letter|enrol|proof of|acceptance letter/.test(own) && !(/\bgraduate\b/.test(own) && !/undergrad/.test(own))) return true; const t = /transcript/.test(fileCtxOwn(i)) ? fileCtxOwn(i) : fileCtx(i); return /transcript/.test(t) && !/resume|\bcv\b|cover letter|enrol|proof of|acceptance letter/.test(t) && !(/\bgraduate\b/.test(t) && !/undergrad/.test(t)); })
       .filter((i, _, all) => !(all.length > 1 && /additional|another|second|other transcript/.test(fileCtxOwn(i))));
     for (const input of inputs) {
@@ -2593,10 +2699,12 @@
       uploadedZones.add(zkey);
       const zone = input.closest('[data-automation-id^="formField"]') || fileZone(input);
       if (textOf(zone).includes(T.name)) continue; // 已经传过
+      if (!uploadAllowed('transcript', T.name)) continue;
       uploadedInputs.add(input);
       const dt = new DataTransfer();
       dt.items.add(resumeFile(T));
       input.files = dt.files;
+      uploadCounted('transcript');
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
       setStatus(`正在上传成绩单：${T.name}…`);
@@ -2706,6 +2814,42 @@
     return !!(await waitFor(uploaded, 8000, 500));
   }
 
+  const EF_CONTACT = new Set(['firstName', 'lastName', 'email', 'phone']);
+  const efErrOf = (el) => fieldErrText(el).trim() || [el.getAttribute('aria-labelledby'), el.getAttribute('aria-describedby'), el.getAttribute('aria-errormessage')].join(' ').split(/\s+/).filter((id) => /-error$/.test(id)).map((id) => textOf(document.getElementById(id))).join(' ').trim();
+  const efPrivacyBtn = () => qa('[role="dialog"] button, [class*="modal" i] button, [class*="dialog" i] button').find((b) => isVisible(b) && !b.closest('#wdaf-host') && /^(confirm|i agree|agree|accept|i accept)$/i.test(cleanLabel(textOf(b))) && /privacy|personal (data|information)/i.test(textOf(b.closest('[role="dialog"], [class*="modal" i], [class*="dialog" i]')).slice(0, 4000)));
+  async function efSettle() {
+    const pb = await waitFor(efPrivacyBtn, 4000, 300);
+    if (pb) {
+      if (!S.settings.acceptTerms) { logAI('⏸ Eightfold：传简历弹了 Data Privacy Agreement，插件没点 Confirm，简历没传上'); return 0; }
+      mouseClick(pb);
+      await waitFor(() => !isVisible(pb), 6000, 300);
+      logAI('📎 Eightfold：Data Privacy Agreement 已点 Confirm');
+    }
+    const snap = () => qa('input:not([type="hidden"]):not([type="file"]):not([type="checkbox"]):not([type="radio"]), textarea').filter((e) => !e.closest('#wdaf-host')).slice(0, 60).map((e) => e.value).join('\u0001');
+    const busy = () => qa('[aria-busy="true"], [role="progressbar"]').some((e) => isVisible(e) && !e.closest('#wdaf-host'));
+    const s0 = snap();
+    let last = s0, calm = 0, moved = false;
+    for (let i = 0; i < 50 && alive(); i++) {
+      await sleep(500);
+      const s = snap();
+      if (s !== s0) moved = true;
+      calm = s === last && !busy() ? calm + 1 : 0;
+      last = s;
+      if (calm >= 6 && (moved || i >= 30)) break;
+    }
+    let n = 0;
+    for (const f of collectFields()) {
+      if (f.kind !== 'text' || !f.el.isConnected) continue;
+      const ans = resolveField(f);
+      if (!ans || !EF_CONTACT.has(ans.key) || !ans.value || Array.isArray(ans.value)) continue;
+      setNative(f.el, ''); await sleep(80); // 先清空：框里的字和要填的一样时，直接再打一遍 React 不认
+      setText(f.el, String(ans.value)); await sleep(150);
+      n++;
+    }
+    dbg('Eightfold：简历解析后重打联系方式', n);
+    return n;
+  }
+
   async function uploadResume() {
     const pick = await chooseResume();
     if (!pick) return false;
@@ -2730,9 +2874,11 @@
         uploadedInputs.add(input);
         const zone = input.parentElement?.parentElement?.parentElement || document.body;
         if (S.resumes.some((r) => textOf(zone).includes(r.name))) continue; // 已经传过
+        if (!uploadAllowed('resume', R.name)) continue;
         const dt = new DataTransfer();
         dt.items.add(resumeFile(R));
         input.files = dt.files;
+        uploadCounted('resume');
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
         setStatus(`正在上传简历：${R.label}…`);
@@ -2741,20 +2887,23 @@
         return true;
       }
       const gBtn = isGoogleForm() && gformButton(/resume|\bcv\b|简历/i);
-      if (gBtn && !uploadedZones.has('gf|resume|' + location.href)) {
+      if (gBtn && !uploadedZones.has('gf|resume|' + location.href) && uploadAllowed('resume', R.name)) {
         uploadedZones.add('gf|resume|' + location.href);
+        uploadCounted('resume');
         setStatus(`正在上传简历：${R.label}…`);
         if (await gformUpload(gBtn, resumeFile(R))) { await sleep(500); return true; }
       }
       const pBtn = pickerOnlyUploads().find((b) => /\bcv\b|resume|r[eé]sum[eé]|curriculum/i.test(pickerLabel(b)) && !/motivation|cover/i.test(pickerLabel(b)));
-      if (pBtn && !uploadedZones.has('pick|resume|' + location.href)) {
+      if (pBtn && !uploadedZones.has('pick|resume|' + location.href) && uploadAllowed('resume', R.name)) {
         uploadedZones.add('pick|resume|' + location.href);
+        uploadCounted('resume');
         setStatus(`正在上传简历：${R.label}…`);
         if (await uploadViaChooser(pBtn, R.name, R.data)) { logAI(`📎 简历 → ${R.label}（接管选文件窗口）`); await sleep(800); return true; }
       }
       const dBtn = uploadDialogButton(RESUME_BTN_RE);
-      if (dBtn && !uploadedZones.has('dlg|resume|' + location.href) && !S.resumes.some((r) => textOf(document.body).includes(r.name))) {
+      if (dBtn && !uploadedZones.has('dlg|resume|' + location.href) && !S.resumes.some((r) => textOf(document.body).includes(r.name)) && uploadAllowed('resume', R.name)) {
         uploadedZones.add('dlg|resume|' + location.href);
+        uploadCounted('resume');
         setStatus(`正在上传简历：${R.label}…`);
         if (await uploadViaDialog(dBtn, resumeFile(R), R.name)) { await sleep(800); return true; }
       }
@@ -2766,9 +2915,11 @@
       if (/transcript|cover letter|writing sample/i.test(zt) && !/resume|\bcv\b/i.test(zt)) continue;
       if (/successfully uploaded/i.test(zt) || S.resumes.some((r) => zt.includes(r.name))) continue;
       if (q('[data-automation-id*="delete" i], [data-automation-id="file-upload-item"]', zone)) continue;
+      if (!uploadAllowed('resume', R.name)) continue;
       const dt = new DataTransfer();
       dt.items.add(resumeFile(R));
       input.files = dt.files;
+      uploadCounted('resume');
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
       setStatus(`正在上传简历：${R.label}…`);
@@ -3827,7 +3978,8 @@
   function coverLetterInputs() {
     const mode = S.settings.aiCoverLetter || 'always';
     if (mode === 'off' || S.settings.useAI === false) return [];
-    return qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host')).filter((i) => {
+    if (isOracleCX() && document.body.textContent.includes(clFileName())) return [];
+    return qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host') && !inChatWidget(i)).filter((i) => {
       const t0 = fileCtxOwn(i);
       const t = CL_RE.test(t0) ? t0 : norm(cleanLabel(precedingText(fileZone(i))) + ' ' + t0);
       const own = norm([i.id, i.name, i.getAttribute('aria-label'), ...String(i.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map((id) => textOf(document.getElementById(id))), ...[...(i.labels || [])].map(textOf)].join(' '));
@@ -3904,7 +4056,8 @@
       return 0;
     }
     let n = 0;
-    if (viaDialog) {
+    if (viaDialog && uploadAllowed('cover', clFileName())) {
+      uploadCounted('cover');
       const clFile = resumeFile({ data: CL.data, name: clFileName(), type: 'application/pdf' });
       const g = isGoogleForm() && gformButton(/cover letter|motivation letter/i);
       const pc = pickerOnlyUploads().find((b) => CL_RE.test(norm(pickerLabel(b))));
@@ -3916,11 +4069,12 @@
       }
     }
     for (const input of inputs) {
-      if (!input.isConnected) continue;
+      if (!input.isConnected || !uploadAllowed('cover', clFileName())) continue;
       uploadedInputs.add(input);
       const dt = new DataTransfer();
       dt.items.add(resumeFile({ data: CL.data, name: clFileName(), type: 'application/pdf' }));
       input.files = dt.files;
+      uploadCounted('cover');
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
       await waitFor(() => textOf(fileZone(input)).includes(clFileName()), 8000, 400);
@@ -3938,7 +4092,7 @@
   function writingSampleInputs() {
     const mode = S.settings.aiWritingSample || 'always';
     if (mode === 'off' || S.settings.useAI === false) return [];
-    return qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host')).filter((i) => {
+    return qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host') && !inChatWidget(i)).filter((i) => {
       const t = fileCtxOwn(i);
       if (!WS_RE.test(t) || /resume|\bcv\b|transcript|cover letter|additional (files|documents)|other (files|documents)/.test(t.replace(WS_RE, ' '))) return false;
       if ((i.files && i.files.length) || uploadedInputs.has(i)) return false;
@@ -3977,11 +4131,12 @@
     }
     let n = 0;
     for (const input of inputs) {
-      if (!input.isConnected) continue;
+      if (!input.isConnected || !uploadAllowed('writing', wsFileName())) continue;
       uploadedInputs.add(input);
       const dt = new DataTransfer();
       dt.items.add(resumeFile({ data: WS.data, name: wsFileName(), type: 'application/pdf' }));
       input.files = dt.files;
+      uploadCounted('writing');
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
       await waitFor(() => textOf(fileZone(input)).includes(wsFileName()), 8000, 400);
@@ -3998,7 +4153,7 @@
   const docJobs = new Map(); // 上传框 → Codex 写文档的 promise
   function docInputs() {
     if (S.settings.useAI === false || S.settings.aiCoverLetter === 'off') return [];
-    return qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host') && !(i.files && i.files.length) && !uploadedInputs.has(i) && !inAutofillZone(i))
+    return qa('input[type="file"]').filter((i) => !i.disabled && !i.closest('#wdaf-host') && !inChatWidget(i) && !(i.files && i.files.length) && !uploadedInputs.has(i) && !inAutofillZone(i))
       .filter((i) => {
         const req = i.required || i.getAttribute('aria-required') === 'true' || [...(i.labels || [])].some((l) => /(^|[\s_-])required([\s_-]|$)/i.test(l.className))
           || !!q('[class*="_required_"]', i.closest('.ashby-application-form-field-entry') || document.createElement('i'));
@@ -4027,10 +4182,12 @@
       setStatus('🤖 等 Codex 写完要上传的文档（一两分钟）…');
       const r = await job;
       if (!r || !r.ok) { aiNote = '文档没写成：' + ((r && r.error) || '没有回应'); continue; }
+      if (!uploadAllowed('doc:' + r.name, r.name)) continue;
       uploadedInputs.add(input);
       const dt = new DataTransfer();
       dt.items.add(resumeFile({ data: r.data, name: r.name, type: 'application/pdf' }));
       input.files = dt.files;
+      uploadCounted('doc:' + r.name);
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
       logAI(`📄 ${r.title || '文档'} → ${r.name}`);
@@ -4716,7 +4873,7 @@
     }
     const registration = fillRegistration();
     let filled = registration ? registration.filled : 0;
-    if (await uploadResume()) { filled++; if (isSfXweb()) filled += await sfResumeDialog(6000); else filled += await resumeReplaceDialog(4000); }
+    if (await uploadResume()) { filled++; if (isSfXweb()) filled += await sfResumeDialog(6000); else filled += await resumeReplaceDialog(4000); if (EF_PAGE) filled += await efSettle(); }
     if (isSfXweb()) filled += await sfResumeDialog(0);
     filled += await resumeReplaceDialog(0);
     filled += await paycomSignature();
@@ -4818,6 +4975,16 @@
         after = collectFields();
         missing = after.filter(stillNeeded);
       }
+    }
+    if (S.settings.acceptTerms && alive()) {
+      let n = 0;
+      for (const f of missing) {
+        const a = f.kind === 'checkbox' && f.el.isConnected ? (ackAnswer(f) || resolveField(f)) : null;
+        if (!a || a.value !== 'CHECK') continue;
+        try { if (await fillField(f, a)) n++; } catch (_) { /* 勾不上就照旧停下给你看 */ }
+        await sleep(300);
+      }
+      if (n) { filled += n; after = collectFields(); missing = after.filter(stillNeeded); }
     }
     filled += await finishCoverLetter();
     filled += await finishWritingSample();
@@ -4944,9 +5111,9 @@
   const buttonText = (b) => cleanLabel(textOf(b) || b.value || b.getAttribute('aria-label') || '');
   const pageButtons = () => (isSfXweb() && ui5All().some((e) => ui5Tag(e) === 'wizard-step')
     ? ui5All().filter((e) => ui5Tag(e) === 'button')
-    : [...qa('button, input[type="submit"], input[type="button"], a[role="button"], [role="button"], a.btn' + (isSR() ? ', spl-button' : ''), formScope()), ...(isSfXweb() ? ui5All().filter((e) => ui5Tag(e) === 'button') : [])])
+    : [...qa('button, input[type="submit"], input[type="button"], a[role="button"], [role="button"], a.btn, ukg-button' + (isSR() ? ', spl-button' : ''), formScope()), ...(isSfXweb() ? ui5All().filter((e) => ui5Tag(e) === 'button') : [])])
     .filter((b) => isVisible(b) && !b.closest('#wdaf-host') && !b.disabled && !b.hasAttribute('disabled'));
-  const NEXT_RE = /^(save (and|&) continue|save (and|&) next|skip (and|&) continue|next|next step|next section|next page|continue|continue to next (step|section|page)|continue to (the )?(application|apply)|proceed|下一步|下一页|继续)( ?[>›→»])?$/i; // Google 表单中文界面是「下一页」
+  const NEXT_RE = /^(submit profile|save (and|&) continue|save (and|&) next|skip (and|&) continue|next|next step|next section|next page|continue|continue to next (step|section|page)|continue to (the )?(application|apply)|proceed|下一步|下一页|继续)( ?[>›→»])?$/i; // Google 表单中文界面是「下一页」
   const SUBMIT_RE = /^(submit|submit application|submit my application|submit your application|apply|apply now|send application|complete application|finish|finish application|提交|提交申请)$/i;
 
   function findNextButton() {
@@ -4994,7 +5161,8 @@
     if (!inBox.length) return false;
     const rej = inBox.find((x) => COOKIE_REJECT_RE.test(x.t)) || (cookieManaged && inBox.find((x) => COOKIE_SAVE_RE.test(x.t)));
     if (rej) { mouseClick(rej.b); dbg('cookie 横幅：点了', rej.t); return true; }
-    const man = !cookieManaged && inBox.find((x) => COOKIE_MANAGE_RE.test(x.t));
+    const leaves = (b) => { const a = b.closest('a[href]'); if (!a) return false; const h = a.getAttribute('href') || ''; if (!h || h.startsWith('#') || /^javascript:/i.test(h)) return false; try { const u = new URL(h, location.href); return u.origin + u.pathname !== location.origin + location.pathname; } catch (_) { return false; } };
+    const man = !cookieManaged && inBox.find((x) => COOKIE_MANAGE_RE.test(x.t) && !leaves(x.b));
     if (man) { cookieManaged = true; mouseClick(man.b); dbg('cookie 横幅：点开设置', man.t); return false; }
     inBox[0].box.style.setProperty('display', 'none', 'important');
     dbg('cookie 横幅：没有拒绝按钮，藏起来');
@@ -5005,12 +5173,15 @@
     try {
       const body = textOf(document.body).slice(0, 20000);
       const paycomDone = /(^|\.)paycomonline\.(net|com)$/i.test(location.hostname) && /export your application/i.test(body);
-      if (running || doneSeen.has(location.href) || !(Q_DONE_PATH.test(location.pathname) || paycomDone) || !Q_DONE_RE.test(body)) return;
-      doneSeen.add(location.href);
+      const click = submitClickGet();
+      const oraDone = oracleSubmitted();
+      const seenKey = location.href + (oraDone && click ? '#' + click.t : '');
+      if (running || doneSeen.has(seenKey) || !(oraDone || ((Q_DONE_PATH.test(location.pathname) || paycomDone) && Q_DONE_RE.test(body)))) return;
+      doneSeen.add(seenKey);
       await addLog('已提交');
       setStatus('🎉 已提交（这是提交成功页）');
-      if (QUEUE) qOut('submitted', '提交成功页');
-      else { let last = ''; try { last = sessionStorage.getItem('wdaf-lastJob') || ''; } catch (_) { /* ignore */ } chrome.runtime.sendMessage({ type: 'queueDoneByUrl', url: last || location.href }, () => void chrome.runtime.lastError); }
+      if (QUEUE) qOut('submitted', oraDone ? 'Oracle 交完跳到 My Applications' : '提交成功页');
+      else { let last = ''; try { last = sessionStorage.getItem('wdaf-lastJob') || ''; } catch (_) { /* ignore */ } chrome.runtime.sendMessage({ type: 'queueDoneByUrl', url: (click && click.url) || last || location.href }, () => void chrome.runtime.lastError); }
     } catch (_) { /* ignore */ }
   }, 3000);
   const cookieTimer = setInterval(() => { try { dismissCookies(); } catch (_) { /* ignore */ } if (++cookieTicks >= 40) clearInterval(cookieTimer); }, 1500);
@@ -5059,7 +5230,7 @@
     let filled = 0;
     for (const el of form.passwords) registrationPasswords.add(el);
     for (const [inputs, value] of [[form.accounts, creds.email], [form.passwords, creds.password]]) {
-      for (const el of inputs) if (!el.value || (value === creds.email && el.value === creds.password)) { setText(el, value); filled++; }
+      for (const el of inputs) if (!el.value || (value === creds.email && (el.value === creds.password || (/@/.test(el.value) && el.value.toLowerCase() !== value.toLowerCase())))) { setText(el, value); filled++; }
     }
     return { filled, complete: form.accounts.length > 0 && form.accounts.every((e) => e.value === creds.email) && form.passwords.every((e) => e.value === creds.password) };
   }
@@ -5073,16 +5244,18 @@
     if (!running || !reg?.complete || registrationAttempted) return false;
     let form = registrationForm();
     if (!form || captchaVisible() || mailOtpFields().length) return false;
-    for (const el of qa('input[type="checkbox"], [role="checkbox"]', form.scope)) {
-      if (!isVisible(el) || el.disabled || el.getAttribute('aria-disabled') === 'true' || el.closest('#wdaf-host') || isChecked(el)) continue;
-      const question = [questionFor(el), choiceLabel(el)].join(' ');
-      if (!S.settings.acceptTerms || SUBSCRIBE_RE.test(norm(question)) || /marketing|promotional|\bsms\b|text message|whatsapp|future (job )?(opportunit|openings)/i.test(question)) continue;
-      if (/terms|conditions|privacy|consent|acknowledge|i (?:have )?read|i agree|隐私|条款|同意/i.test(question)) await clickChoiceReal(el);
+    const regBoxShown = (el) => isVisible(el) || (el.type === 'checkbox' && isVisible(el.closest('label') || el.parentElement));
+    for (const el of qa('input[type="checkbox"], [role="checkbox"]', document)) {
+      if (!regBoxShown(el) || el.disabled || el.getAttribute('aria-disabled') === 'true' || el.closest('#wdaf-host') || isChecked(el)) continue;
+      const wdConsent = el.getAttribute('data-automation-id') === 'createAccountCheckbox';
+      const question = [questionFor(el), choiceLabel(el), textOf(el.closest('label') || el.parentElement?.parentElement || el)].join(' ');
+      if (!S.settings.acceptTerms || (!wdConsent && (SUBSCRIBE_RE.test(norm(question)) || /marketing|promotional|\bsms\b|text message|whatsapp|future (job )?(opportunit|openings)/i.test(question)))) continue;
+      if (wdConsent || /terms|conditions|privacy|consent|acknowledge|i (?:have )?read|i agree|隐私|条款|同意/i.test(question)) await clickChoiceReal(el);
       if (!running) return false;
     }
     form = registrationForm();
     if (!form || !form.accounts.length || form.accounts.some((el) => el.value !== S.registration.email) || form.passwords.some((el) => el.value !== S.registration.password)) return false;
-    const invalid = qa('input, select, textarea, [role="checkbox"]', form.scope).some((el) => isVisible(el) && !el.disabled && !el.closest('#wdaf-host')
+    const invalid = qa('input, select, textarea, [role="checkbox"]', form.scope).some((el) => (isVisible(el) || (el.type === 'checkbox' && regBoxShown(el))) && !el.disabled && !el.closest('#wdaf-host')
       && (el.getAttribute('aria-invalid') === 'true' || (el.validity && !el.validity.valid)
         || ((el.type === 'checkbox' || el.getAttribute('role') === 'checkbox') && !isChecked(el)
           && (isRequired({ el, kind: 'checkbox', question: questionFor(el) }) || /terms|conditions|privacy|consent|隐私|条款|同意/i.test(choiceLabel(el))))));
@@ -5092,13 +5265,90 @@
       return false;
     }
     const button = qa('button, input[type="submit"], input[type="button"], [role="button"]', form.scope).find((el) => isVisible(el) && !el.closest('#wdaf-host')
-      && (/^(?:create (?:an? |your )?(?:account|login)|sign[ -]?up|register|注册|创建(?:账号|帐户|账户))$/i.test(buttonText(el)) || el.getAttribute('data-automation-id') === 'createAccountSubmitButton'));
+      && (/^(?:create (?:an? |your )?(?:account|login)|sign[ -]?up|register|submit profile|注册|创建(?:账号|帐户|账户))$/i.test(buttonText(el)) || el.getAttribute('data-automation-id') === 'createAccountSubmitButton'));
     if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true' || !running) return false;
     registrationAttempted = true; // 一页只尝试一次，账号已存在、密码被拒等错误不自动连点。
+    if (isWD()) { try { sessionStorage.setItem(WD_REG_AT, String(Date.now())); } catch (_) { /* ignore */ } } // 注册完回到 Sign In 页时，wdAutoSignIn 靠它知道该登录而不是再去注册
     sessionStorage.setItem(AUTO_KEY, '1'); // 整页跳转后也接着投当前职位。
     setStatus('正在创建账号，成功后自动继续申请…');
     button.click();
     return true;
+  }
+
+  const WD_SIGNIN_FAIL = 'wdaf-wdSignInFail';
+  const WD_SIGNIN_TRIES = 'wdaf-wdSignInTries';
+  const WD_REG_AT = 'wdaf-wdRegAt';
+  const WD_MAIL_VERIFY = 'wdaf-wdMailVerify';
+  async function wdMailVerify(regAt) {
+    const send = (m) => new Promise((res) => { try { chrome.runtime.sendMessage(m, (x) => res(chrome.runtime.lastError ? null : x)); } catch (_) { res(null); } });
+    for (let i = 0; i < 5 && running && alive(); i++) {
+      const r = await send({ type: 'mailbox', action: 'mailLink', since: regAt / 1000 - 120 });
+      if (!r || r.error || r.ok === false) { dbg('Workday 验证邮件：取不了', r && r.error); return false; }
+      if (r.url) {
+        let same = false; try { same = new URL(r.url).hostname === location.hostname; } catch (_) { /* ignore */ }
+        if (!same) return false;
+        const o = await send({ type: 'openVerifyLink', url: r.url });
+        dbg('Workday 验证邮件：已在后台打开验证链接', !!(o && o.ok));
+        return !!(o && o.ok);
+      }
+      await sleep(8000);
+    }
+    return false;
+  }
+  async function wdAutoSignIn() {
+    const creds = S.registration || {};
+    if (!isWD() || !running || !creds.email || !creds.password || captchaVisible()) return false;
+    const box = q('[data-automation-id="signInContent"]') || document;
+    const btn = q('[data-automation-id="signInSubmitButton"]', box);
+    const pws = qa('input[type="password"]', box).filter((e) => isVisible(e) && !e.disabled);
+    const email = q('input[data-automation-id="email"]', box) || qa('input[type="email"], input[type="text"]', box).filter(isVisible)[0];
+    if (!pws.length) {
+      const viaEmail = qa('button, a, [role="button"]', box).find((b) => isVisible(b) && /^sign in with e-?mail$/i.test(buttonText(b)));
+      if (viaEmail) { viaEmail.click(); await waitFor(() => qa('input[type="password"]', q('[data-automation-id="signInContent"]') || document).some(isVisible), 6000, 300); return true; }
+    }
+    if (!btn || !isVisible(btn) || pws.length !== 1 || !email || !isVisible(email)) return false; // 不是登录视图（Create Account 视图有两栏密码，走原来的注册流程）
+    const num = (store, k) => { try { return Number(store.getItem(k)) || 0; } catch (_) { return 0; } };
+    const tries = num(sessionStorage, WD_SIGNIN_TRIES);
+    const justRegistered = Date.now() - num(sessionStorage, WD_REG_AT) < 15 * 60000;
+    const failedRecently = Date.now() - num(localStorage, WD_SIGNIN_FAIL) < 24 * 3600000;
+    const toCreate = async () => {
+      if (num(sessionStorage, WD_REG_AT)) return false; // 这个标签页已经注册过一次了：不来回切
+      const link = q('[data-automation-id="createAccountLink"]', box) || qa('button, a, [role="button"]', box).find((b) => isVisible(b) && /^create account$/i.test(buttonText(b)));
+      if (!link) return false;
+      setStatus('这家公司的 Workday 还没有账号，去注册…');
+      link.click();
+      await waitFor(() => qa('input[type="password"]', q('[data-automation-id="signInContent"]') || document).filter(isVisible).length >= 2, 6000, 300);
+      return true;
+    };
+    const regAt = num(sessionStorage, WD_REG_AT);
+    if (regAt && !num(sessionStorage, WD_MAIL_VERIFY) && S.mailbox && S.mailbox.enabled) {
+      try { sessionStorage.setItem(WD_MAIL_VERIFY, String(Date.now())); } catch (_) { /* ignore */ }
+      setStatus('去邮箱找这家公司的账号验证邮件…');
+      if (await wdMailVerify(regAt)) {
+        try { sessionStorage.setItem(WD_SIGNIN_TRIES, '0'); localStorage.removeItem(WD_SIGNIN_FAIL); sessionStorage.setItem(WD_REG_AT, String(Date.now())); } catch (_) { /* ignore */ }
+        setStatus('验证链接已打开，稍等再登录…');
+        await sleep(15000);
+        return true;
+      }
+    }
+    if (justRegistered ? tries >= 2 : (tries >= 1 || failedRecently)) return justRegistered ? false : toCreate();
+    try { sessionStorage.setItem(WD_SIGNIN_TRIES, String(tries + 1)); } catch (_) { /* ignore */ }
+    registrationPasswords.add(pws[0]);
+    setText(email, creds.email); await sleep(150);
+    setText(pws[0], creds.password); await sleep(300);
+    if (email.value !== creds.email || pws[0].value !== creds.password || !running) return false;
+    setStatus('正在用已存的账号登录这家公司的 Workday…');
+    sessionStorage.setItem(AUTO_KEY, '1'); // 登录后整页跳转也接着投当前职位
+    const filter = btn.parentElement && q('[data-automation-id="click_filter"]', btn.parentElement);
+    (filter || btn).click();
+    const errNow = () => qa('[data-automation-id="errorMessage"], [role="alert"]').filter((e) => isVisible(e) && !e.closest('#wdaf-host')).map(textOf).join(' ');
+    await waitFor(() => !isSignInPage() || /wrong|invalid|incorrect|verif|locked|error/i.test(errNow()), 15000, 400);
+    if (!isSignInPage()) { try { localStorage.removeItem(WD_SIGNIN_FAIL); } catch (_) { /* ignore */ } dbg('Workday：自动登录成功'); return true; }
+    const e = errNow();
+    dbg('Workday：自动登录没成功', e.slice(0, 120));
+    if (justRegistered || (/verif/i.test(e) && !/wrong|invalid|incorrect/i.test(e))) { setStatus('这个 Workday 账号可能要先点邮件里的验证链接，验证后会自动继续。' + (e ? '（' + e.slice(0, 80) + '）' : '')); return false; }
+    if (/wrong|invalid|incorrect/i.test(e)) { try { localStorage.setItem(WD_SIGNIN_FAIL, String(Date.now())); } catch (_) { /* ignore */ } return toCreate(); }
+    return false;
   }
 
   async function waitForRegistration(done, timeout) {
@@ -5129,14 +5379,35 @@
   async function fillMailboxCode() {
     const fields = mailOtpFields();
     if (!fields.length || !S.mailbox?.enabled || !S.mailbox.email || fields.some((el) => el.value)) return;
-    if (!(fields.length === 1 || (fields.length >= 4 && fields.length <= 8 && fields.every((el) => el.maxLength === 1)))) return;
+    const digitBox = (el) => el.maxLength === 1 || /\bdigit \d+ of\b|pin[-_ ]?code[-_ ]?\d|code (?:character|digit)/i.test([el.id, el.name, el.getAttribute('aria-label')].join(' '));
+    if (!(fields.length === 1 || (fields.length >= 4 && fields.length <= 8 && fields.every(digitBox)))) return;
     const sig = location.href + '|' + fields.map((el) => el.name + ':' + el.id).join('|');
     if (!mailOtpState || mailOtpState.sig !== sig) mailOtpState = { sig, since: Date.now() / 1000 - 60, deadline: Date.now() + 120000, next: 0, busy: false, stopped: false };
     const state = mailOtpState;
     if (state.busy || state.stopped || Date.now() < state.next) return;
     if (Date.now() > state.deadline) { state.stopped = true; setStatus('等待邮箱验证码超时，请手动填入或重新发送。'); return; }
-    const emails = textOf(document.body).slice(0, 30000).match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
-    if (emails.length && !emails.some((email) => email.toLowerCase() === S.mailbox.email.toLowerCase())) { state.stopped = true; setStatus('页面收件邮箱与已连接的 Outlook 不一致，请手动核对。'); return; }
+    const myMail = S.mailbox.email.toLowerCase();
+    let zone = fields[0];
+    for (let up = fields[0].parentElement; up && up !== document.body; up = up.parentElement) {
+      const t = textOf(up);
+      if (t.length > 4000) break;
+      zone = up;
+      if (/@/.test(t) && /code/i.test(t)) break;
+    }
+    const siteTok = (location.hostname.split('.').find((p) => p.length >= 3 && !/^(www|careers?|jobs?|fa|us\d|eu\d|ocs|saasfaprod\d*)$/i.test(p) && !/^fa-/.test(p)) || '').toLowerCase();
+    const roleMail = /^(no-?reply|do-?not-?reply|accessib\w*|accommodat\w*|privacy|support|help\w*|careers?|recruit\w*|talent\w*|hr|jobs?|info|admin|ethics|disability|eeo\w*)@/i;
+    const sameMail = (e) => {
+      e = e.toLowerCase();
+      if (e === myMail) return true;
+      if (!/[*•]/.test(e)) return false;
+      const [lp, dom] = e.split('@'), [mlp, mdom] = myMail.split('@');
+      if (dom.replace(/[*•]+/g, '') && !/[*•]/.test(dom) && dom !== mdom) return false;
+      const head = lp.match(/^[^*•]*/)[0], tail = lp.match(/[^*•]*$/)[0];
+      return mlp.startsWith(head) && mlp.endsWith(tail);
+    };
+    const emails = (textOf(zone).slice(0, 4000).match(/[A-Z0-9._%+*•-]+@[A-Z0-9.*•-]+\.[A-Z]{2,}/gi) || [])
+      .filter((e) => !roleMail.test(e) && !/@(\w+\.)?example\.(com|org)$/i.test(e) && !(siteTok && e.split('@')[1].toLowerCase().includes(siteTok)));
+    if (emails.length && !emails.some(sameMail)) { state.stopped = true; setStatus('页面收件邮箱与已连接的 Outlook 不一致，请手动核对。'); return; }
     state.busy = true;
     state.next = Date.now() + 8000;
     setStatus('📧 正在等待并匹配当前招聘网站的邮箱验证码…');
@@ -5153,7 +5424,14 @@
       for (const el of fields) mailboxCodeInputs.add(el);
       fields.forEach((el, i) => setText(el, fields.length > 1 ? code[i] : code));
       state.stopped = true;
-      setStatus('✅ 邮箱验证码已自动填入，请检查后点网站的「验证 / 继续」。');
+      const verifyBtn = QUEUE && qa('button, input[type="submit"], [role="button"]').find((b) => isVisible(b) && !b.closest('#wdaf-host') && !b.disabled
+        && /^(verify|verify code|verify (my )?(email|identity)|confirm|submit|continue|next|验证|继续|确认|提交)$/i.test(buttonText(b)));
+      if (verifyBtn) {
+        await sleep(700);
+        verifyBtn.click();
+        setStatus('✅ 邮箱验证码已自动填入并点了「' + buttonText(verifyBtn) + '」，接着申请…');
+        sessionStorage.setItem(AUTO_KEY, '1');
+      } else setStatus('✅ 邮箱验证码已自动填入，请检查后点网站的「验证 / 继续」。');
     } finally { state.busy = false; }
   }
 
@@ -5161,11 +5439,21 @@
     ? currentStep() + '|' + location.pathname
     : location.href + '|' + document.title + '|' + collectFields().map((f) => f.question).join('|').slice(0, 800);
 
-  const Q_DONE_RE = /we appreciate your interest(?![^.]{0,80}(unfortunately|however|no longer))|thank you for your interest\.(?!\s*(unfortunately|however|this (job|position|posting|role)|we are no longer|we are (currently )?not accepting))|application (has been |was )?(successfully )?(submitted|received|sent)|thank you for (applying|your application|submitting)|thanks for applying|successfully (applied|submitted)|we('ve| have) received your application|your application has been sent|application submitted|application success\b|we('re| are) thrilled that you('re| are) interested|感[谢謝](您)?(的申[请請]|申[请請]|花[时時][间間]申[请請]|投[递遞])|申[请請](已|已[经經])(提交|送出|收到)|已收到[你您]的申[请請]/i; // Greenhouse 按浏览器语言显示确认页（Garda 实测是中文「感謝您花時間申請」）
+  const Q_DONE_RE = /we appreciate your interest(?![^.]{0,80}(unfortunately|however|no longer))|thank you for your interest\.(?!\s*(unfortunately|however|this (job|position|posting|role)|we are no longer|we are (currently )?not accepting))|application (has been |was )?(successfully )?(submitted|received|sent)|thank you for (applying|your (job )?application|submitting)|thanks for applying|successfully (applied|submitted)|we('ve| have) received your application|your application has been sent|application submitted|application success\b|we('re| are) thrilled that you('re| are) interested|感[谢謝](您)?(的申[请請]|申[请請]|花[时時][间間]申[请請]|投[递遞])|申[请請](已|已[经經])(提交|送出|收到)|已收到[你您]的申[请請]/i; // Greenhouse 按浏览器语言显示确认页（Garda 实测是中文「感謝您花時間申請」）
   const US_PERSON_RE = /legally requires? .{0,30}u\.?s\.? person|requires? ["“]?u\.?s\.? person["”]? status|must be (a )?u\.?s\.? (citizen|person)\b|(only|exclusively) (open|available) to u\.?s\.? citizens|u\.?s\.? citizenship (is )?(required|mandatory)|requires? u\.?s\.? citizenship|(can |will )?only (hire|employ|consider|accept|sponsor) u\.?s\.? citizens|(open|available) only to u\.?s\.? citizens/i; // Thought Logic 题目「Due to company restrictions, we can only hire U.S. Citizens or those with a valid Green Card」
-  const Q_CLOSED_RE = /(this|the) (job|position|posting|requisition|role|opening)( posting)? (is )?(no longer|not) (available|accepting|open|active)|(job|position) you are (trying|looking) to apply (for|to) has been filled|(job|position|posting|requisition) (has been |is )?(closed|filled|expired|removed)|no longer accepting applications|(is )?not (currently )?accepting (new )?applications|page (you are looking for|you requested|you're looking for) (doesn'?t|does not|could not|cannot|can'?t) (exist|be found)|page (you are|you're) looking for (no longer exists|has been removed)|job not found|(this|the) job (is|has) (closed|expired)|sorry,? (this|the) (job|position|posting) |(currently |are |is )?not (currently )?accepting (any )?(further |more |new |additional )?(applicants|applications)/i; // Scotiabank「We are currently not accepting any further applicants for this role.」
+  const Q_CLOSED_RE = /(we'?re )?sorry,? we could ?n[o']?t find what you(?:'re| are) looking for|custom job error|(this|the) (job|position|posting|requisition|role|opening)( posting)? (is )?(no longer|not) (available|accepting|open|active)|(job|position) you are (trying|looking) to apply (for|to) has been filled|(job|position|posting|requisition) (has been |is )?(closed|filled|expired|removed)|no longer accepting applications|(is )?not (currently )?accepting (new )?applications|page (you are looking for|you requested|you're looking for) (doesn'?t|does not|could not|cannot|can'?t) (exist|be found)|page (you are|you're) looking for (no longer exists|has been removed)|job not found|(this|the) job (is|has) (closed|expired)|sorry,? (this|the) (job|position|posting) |(currently |are |is )?not (currently )?accepting (any )?(further |more |new |additional )?(applicants|applications)/i; // Scotiabank「We are currently not accepting any further applicants for this role.」
   const Q_DUP_RE = /you('ve| have) already applied|already (applied|submitted an application) (for|to) this|you have previously applied (for|to) this|application already received/i; // Lever：…/already-received「Application already received」（BPM LLP）
-  const Q_APPLY_RE = /^(apply|apply now|apply for ((this|the|a) )?(job|position|role|opportunity)|apply to (this )?(job|position|role)|apply online|apply here|apply on (the )?company('s)? (site|website)|start (your |my )?application|i'?m interested|submit (an )?application)$/i;
+  const Q_CLOSED_WEAK_RE = /^(job|position|posting|requisition) (has been |is )?(closed|filled|expired|removed)$/i;
+  function qClosedHit(body) {
+    const hits = [...String(body || '').matchAll(new RegExp(Q_CLOSED_RE.source, 'gi'))].map((m) => m[0]);
+    if (!hits.length) return '';
+    const strong = hits.find((h) => !Q_CLOSED_WEAK_RE.test(h));
+    if (strong) return strong;
+    const entry = q('a[href*="/talentcommunity/apply/"]') || qa('a, button, [role="button"], input[type="submit"], input[type="button"]')
+      .find((e) => isVisible(e) && !e.closest('#wdaf-host') && Q_APPLY_RE.test(cleanLabel(textOf(e) || e.value || e.getAttribute('aria-label') || '').replace(/\s*[›»→>]+$/, '')));
+    return entry ? '' : hits[0];
+  }
+  const Q_APPLY_RE = /^(apply|apply now|apply for ((this|the|a) )?(job|position|role|opportunity)|apply to (this )?(job|position|role)|apply online|apply here|apply on (the )?company('s)? (site|website)|start (your |my )?application|i'?m interested|submit (an )?application|(立即|[马馬]上|[现現]在|[开開]始|[继繼][续續]|我要|在[线線]|[网網]上)?申[请請]((此|[该該]|本|[这這][个個])?([职職]位|[岗崗]位|工作))?|(立即|我要)?([应應]聘|[应應][征徵])((此|[该該]|本)?([职職]位|[岗崗]位))?|(立即|一[键鍵])?投[递遞]([简簡][历歷])?)$/i; // Chrome 界面是中文时有些招聘站给中文页（Arup selectminds 2026-11-10）：整句匹配，「我的申请 / 申请状态 / 申请记录 / 提交申请」不算
   let qReported = false; // 这一轮自动流程已经回报过结果
   let qLastState = '';
   let qLastProgress = 0;
@@ -5196,8 +5484,23 @@
   const Q_DONE_PATH = /\/(apply-?)?(confirmation|thank-?you|thanks|success|submitted|application-?complete)(\/|$)|\/jobTasks\/completed\//i; // Workday 交完：/jobTasks/completed/application（弹「Application Submitted」） // Phenom（Freddie Mac）：/us/en/applythankyou
   function qSuccessNow(before, path0) {
     if (path0 && location.pathname !== path0 && Q_DONE_PATH.test(location.pathname)) return true;
+    if (oracleSubmitted()) return true;
     const m = textOf(document.body).slice(0, 30000).match(Q_DONE_RE);
     return !!m && !String(before || '').includes(m[0]);
+  }
+  function oracleSubmitted() {
+    if (!/\/CandidateExperience\/.*\/my-profile\b/i.test(location.pathname)) return false;
+    const c = submitClickGet(3 * 60000);
+    if (!c || !/\/CandidateExperience\/.*\/job\//i.test(c.url)) return false;
+    const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const title = norm(String(c.title || '').split(/\s+application,\s*step\b/i)[0]);
+    if (title.length < 6 || title.length > 150) return false;
+    const body = norm(textOf(document.body).slice(0, 60000));
+    const NEG = /\b(drafts?|incomplete|not submitted|unfinished|unconfirmed|to be confirmed|pending (confirmation|verification)|continue applying|(continue|complete|finish|resume) (your |the |my )?(job )?application)\b/;
+    let at = body.indexOf(title);
+    if (at < 0) return false;
+    for (let n = 0; at >= 0 && n < 30; at = body.indexOf(title, at + title.length), n++) if (NEG.test(body.slice(Math.max(0, at - 150), at + title.length + 250))) return false;
+    return true;
   }
   function captchaVisible() {
     return qa('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[title*="captcha" i], iframe[title*="challenge" i]')
@@ -5227,8 +5530,9 @@
       && !/resume|\bcv\b|curriculum/.test(fileCtxOwn(i)));
     if (emptyReqFile.length) return `有 ${emptyReqFile.length} 个必填上传栏空着（${emptyReqFile.map((i) => cleanLabel(questionFor(i) || precedingText(fileZone(i)) || '上传').slice(0, 60)).join('；')}），要你准备好文件传上去`;
     const body = textOf(document.body);
-    const resumeShown = S.resumes.some((r) => r.name && body.toLowerCase().includes(r.name.toLowerCase()));
-    const emptyResume = qa('input[type="file"]').filter((i) => /resume|\bcv\b/.test(fileCtxOwn(i)) && !/cover|letter|transcript/i.test(i.name || i.id || '') && !(i.files && i.files.length));
+    const allText = (body + ' ' + document.body.textContent).toLowerCase();
+    const resumeShown = S.resumes.some((r) => r.name && allText.includes(r.name.toLowerCase()));
+    const emptyResume = qa('input[type="file"]').filter((i) => /resume|\bcv\b/.test(fileCtxOwn(i)) && !/cover|letter|transcript/i.test(i.name || i.id || '') && !(i.files && i.files.length) && !/^import your profile/i.test(i.getAttribute('aria-label') || ''));
     if (emptyResume.length && !resumeShown) return '简历栏是空的';
     const miss = collectFields().filter((f) => stillNeeded(f));
     if (miss.length) return `还有 ${miss.length} 个必填项空着`;
@@ -5245,6 +5549,9 @@
   }
   function looksLikeRealApplication() {
     if (qa('input[type="file"]').some((i) => !i.closest('#wdaf-host') && !isSubscribeForm(i.closest('form')))) return true;
+    if (/\/apply\/(section|step)\/\d+/i.test(location.pathname) || /application,? step \d+ of \d+/i.test(textOf(document.body).slice(0, 4000))) return true;
+    const sb = findSubmitButton();
+    if (qa('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="search"]), select, textarea', (sb && sb.closest('form')) || document).filter((i) => !i.closest('#wdaf-host') && isVisible(i) && !isSubscribeForm(i.closest('form'))).length >= 15) return true;
     const filled = collectFields().filter((f) => !isSubscribeForm(f.el.closest && f.el.closest('form')) && !isEmpty(f)).length;
     return filled >= 4;
   }
@@ -5288,7 +5595,7 @@
         uploadedZones.delete(zkey);
         try { sessionStorage.removeItem('wdaf-up|' + zkey); } catch (_) { /* ignore */ }
       }
-      await uploadResume();
+      if (await uploadResume() && EF_PAGE) await efSettle(); // Eightfold：补传会把联系方式重置，等解析完重打
       await sleep(1500);
       bad = qPreSubmitProblem();
     }
@@ -5314,6 +5621,10 @@
       if (r === 'stop') return;
       if (attempt === 0) {
         lastPageErrors = pageErrors();
+        for (const el of qa('input, textarea', formScope())) {
+          if (el.closest('#wdaf-host') || !isVisible(el) || !el.value || el.readOnly || /^(checkbox|radio|file|hidden|password)$/i.test(el.type) || el.getAttribute('role') === 'combobox' || !(el.getAttribute('aria-invalid') === 'true' || efErrOf(el))) continue;
+          const v0 = el.value; setNative(el, ''); await sleep(80); setText(el, v0); await sleep(120);
+        }
         reviewedSigs.clear();
         try { const rep = await fillPage(); if (rep.missing.length && !(await aiAnswerMissing(rep.missing, true))) { await addLog('提交被拒'); setStatus(`提交没过，还有 ${rep.missing.length} 个必填项没填`, rep.missing.map((f) => f.question)); return; } } finally { lastPageErrors = []; }
       }
@@ -5335,7 +5646,7 @@
   }
   async function queueDrive() {
     const afterSubmit = (QUEUE.submitAt && Date.now() - QUEUE.submitAt < 15 * 60000) || (QUEUE.status === 'needs' && ['ready', 'verify', 'captcha'].includes(QUEUE.need));
-    if (afterSubmit && (Q_DONE_RE.test(textOf(document.body).slice(0, 30000)) || Q_DONE_PATH.test(location.pathname))) { await addLog('已提交'); qOut('submitted', '提交成功页'); return; }
+    if (afterSubmit && (Q_DONE_RE.test(textOf(document.body).slice(0, 30000)) || Q_DONE_PATH.test(location.pathname) || oracleSubmitted())) { await addLog('已提交'); qOut('submitted', '提交成功页'); return; }
     if (afterSubmit && (/^(500|502|503)\b|internal server error|bad gateway|service unavailable/i.test(document.title) || /something went wrong at our end/i.test(textOf(document.body).slice(0, 3000)))) {
       await addLog('提交被拒'); setStatus('网站提交时报错（' + document.title.slice(0, 40) + '），没交上，稍后重投'); qOut('error', '提交后网站报错（' + document.title.slice(0, 40) + '），没交上'); return;
     }
@@ -5346,8 +5657,13 @@
       if (maybeApplication()) { onDetected(); return; }
       const body = textOf(document.body).slice(0, 6000);
       if (Q_DUP_RE.test(body) || /\/already-received\/?$/.test(location.pathname)) { qOut('dup', '页面说已经投过'); return; }
-      if (Q_CLOSED_RE.test(body) || /[?&]error=true/.test(location.search) || /\/jobs\/jobnotfound\b/i.test(location.pathname)) { qOut('closed', '职位已关闭：' + ((body.match(Q_CLOSED_RE) || [])[0] || location.search)); return; }
-      if (QUEUE && QUEUE.url && /^\/([a-z]{2}(-[a-z]{2})?\/?)?$/i.test(location.pathname) && (() => { try { return new URL(QUEUE.url).pathname.split('/').filter(Boolean).length >= 2; } catch (_) { return false; } })()) { qOut('closed', '职位页跳回了招聘首页（职位多半已下线）'); return; }
+      const closedHit = qClosedHit(body);
+      if (closedHit || /[?&]error=true/.test(location.search) || /\/jobs\/jobnotfound\b/i.test(location.pathname)) { qOut('closed', '职位已关闭：' + (closedHit || location.search)); return; }
+      if (QUEUE && QUEUE.url && /\/CandidateExperience\/.*\/(job|requisitions\/preview)\/\d+/i.test(QUEUE.url) && /\/CandidateExperience\/.*\/sites\/[^/]+\/jobs\/?$/i.test(location.pathname)) { qOut('closed', '职位已关闭：职位页被跳回了职位列表'); return; }
+      if (QUEUE && QUEUE.url && /^\/([a-z]{2}(-[a-z]{2})?\/?)?$/i.test(location.pathname) && (() => { try { return new URL(QUEUE.url).pathname.split('/').filter(Boolean).length >= 2; } catch (_) { return false; } })()) {
+        if (/^(login|signin|auth|sso|passport|accounts?)\./i.test(location.hostname) || isSignInPage()) { qOut('login', '要登录或注册：' + location.hostname); return; }
+        qOut('noform', '职位链接跳回了招聘首页，没确认职位还在不在，请看一眼'); return;
+      }
       if (/application submission is (currently )?unavailable|please try again later/i.test(body) && /ashbyhq\.com$/.test(location.hostname)) { setStatus('⏸ Ashby 暂时不收申请（多半是网站的防机器人限制）。过一阵请你自己打开试。'); qOut('ready', 'Ashby 暂时不收申请（多半是防机器人限制），过一阵你自己试'); return; }
       if (S.profile.needSponsorship === 'Yes' && US_PERSON_RE.test(body)) { setStatus('⛔ 这个职位只收美国公民 / 绿卡 / U.S. Person，不投。'); qOut('ineligible', '只收美国公民 / U.S. Person：' + body.match(US_PERSON_RE)[0]); return; }
       const rmk = q('a.dialogApplyBtn[href*="/talentcommunity/apply/"], a[href*="/talentcommunity/apply/"]');
@@ -5359,7 +5675,7 @@
       await qSend({ state: 'hop' });
       setStatus('批量队列：点 Apply…');
       const href = a.tagName === 'A' && a.getAttribute('href');
-      if (href && !/^(#|javascript:)/i.test(href)) location.assign(a.href); // 同一个标签页打开，不弹新窗口
+      if (href && !/^(#|javascript:)/i.test(href) && !/\/talentcommunity\/apply\//.test(href)) location.assign(a.href); // 同一个标签页打开，不弹新窗口
       else a.click();
       await sleep(4000);
     }
@@ -5371,20 +5687,36 @@
         await sleep(5000);
       }
       if (appDetected || running) return;
-      if (/\/(sign[_-]?in|log[_-]?in)\b/i.test(location.pathname) || isSignInPage()) { qOut('login', '要登录或注册：' + location.hostname); return; }
+      if (/\/(sign[_-]?in|log[_-]?in)\b/i.test(location.pathname) || /^(login|signin|auth)\./i.test(location.hostname) || isSignInPage()) { qOut('login', '要登录或注册：' + location.hostname); return; }
       qOut('noform', '没找到申请表或 Apply 按钮');
     }
+  }
+
+  async function queueHello() {
+    for (let i = 0; i < 3 && !QUEUE; i++) {
+      const t0 = Date.now();
+      const r = await new Promise((res) => {
+        setTimeout(() => res(null), 2000 + i * 2000);
+        try { chrome.runtime.sendMessage({ type: 'queueHello' }, (x) => { void chrome.runtime.lastError; res(x || null); }); } catch (_) { res(false); }
+      });
+      if (r && r.item) { QUEUE = r.item; QUEUE_SUBMIT = !!r.autoSubmit; dbg('批量队列任务', QUEUE); return true; }
+      if (r || r === false) return false; // 明确答了「不是」，或插件已断开
+      if (Date.now() - t0 < 1500) await sleep(1500); // 立刻报错回来的（后台还没起来）：等一下再问
+    }
+    return !!QUEUE;
   }
 
   async function onReview() {
     await addLog('已填到 Review');
     await healthCard();
+    if (!QUEUE) { try { await queueHello(); } catch (_) { /* 当成不是队列的页 */ } }
     if (QUEUE ? !QUEUE_SUBMIT : !S.settings.autoSubmit) {
       setStatus('✅ 已到 Review 页。请检查一遍，确认无误后自己点 Submit。');
       qOut('ready', '已到 Review 页，等你点 Submit');
       return;
     }
-    const btn = findSubmitButton();
+    let btn = findSubmitButton();
+    if (!btn) { await waitFor(findSubmitButton, 15000, 500); btn = findSubmitButton(); }
     if (!btn) { setStatus('到了 Review 页，但没找到 Submit 按钮'); return; }
     const bad = QUEUE && qPreSubmitProblem();
     if (bad) { setStatus(`没自动提交：${bad}。请检查。`); return; }
@@ -5479,7 +5811,7 @@
           break;
         }
         const closedBody = textOf(document.body).slice(0, 6000);
-        if (QUEUE && (/\/jobs?\/?notfound\b|\/jobnotfound\b/i.test(location.pathname) || /^(job|position|page) not found\b/i.test(document.title) || Q_CLOSED_RE.test(closedBody)) && !findSubmitButton()) {
+        if (QUEUE && (/\/jobs?\/?notfound\b|\/jobnotfound\b/i.test(location.pathname) || /^(job|position|page) not found\b/i.test(document.title) || qClosedHit(closedBody)) && !findSubmitButton()) {
           qOut('closed', '职位已关闭：' + (document.title || location.pathname).slice(0, 60)); setStatus('这个职位已经关闭（页面：' + document.title.slice(0, 40) + '）。'); break;
         }
         if (!findSubmitButton() && !/(^|\.)paradox\.ai$/i.test(location.hostname) && await aiAdvancePage('no-next')) { await sleep(1200); continue; }
@@ -5516,7 +5848,9 @@
           .map((e) => cleanLabel(e.matches('input, select, textarea, [role="combobox"]') ? (questionFor(e) || e.id || e.name || '') : textOf(e)).slice(0, 70)).filter((t) => t.length > 2))].slice(0, 5);
         if (QUEUE && (captchaVisible() || await waitFor(captchaVisible, 6000, 400) || (/(^|\.)paycomonline\.(net|com)$/i.test(location.hostname) && q('iframe[src*="hcaptcha"]')))) { qOut('captcha', '点下一步后要过人机验证'); setStatus('🧩 网站弹了人机验证，请你点一下验证码再继续。'); break; }
         if (QUEUE && errs.some((t) => /already (been )?registered|account (already )?exists|already have an account/i.test(t))) { qOut('login', '邮箱已在这个网站注册过，要登录：' + location.hostname); setStatus('这个邮箱已经在这个网站注册过账号，要登录后再申请，留给你。'); break; }
+        if (QUEUE && isWD() && /page error\s*-\s*error code/i.test(textOf(document.body)) && !sessionStorage.getItem('wdafWdPageErrReload')) { sessionStorage.setItem('wdafWdPageErrReload', '1'); setStatus('Workday 报 Page Error（多半是页面挂太久、登录过期），刷新一次'); location.reload(); break; }
         if (await aiAdvancePage('stuck', errs)) { await sleep(1200); continue; }
+        if (QUEUE && (captchaVisible() || q('iframe[src*="hcaptcha"]') || await waitFor(captchaVisible, 5000, 400))) { qOut('captcha', '点下一步后要过人机验证'); setStatus('点下一步后弹出人机验证，请你自己过一下，过完插件接着填。'); break; }
         setStatus(errs.length ? `页面报错，请手动处理：${errs.slice(0, 3).join('；')}` : '点了下一步，但页面没有变化，请检查有没有漏填的。' + (hint.length ? `（标红：${hint.join('；')}）` : ''));
         break;
       }
@@ -5538,7 +5872,18 @@
       renderPanel();
       return;
     }
-    if (QUEUE && (/[?&]status=alreadyApplied\b/i.test(location.search) || /you('ve| have) already applied (for|to) this (job|position|role|opportunity)/i.test(textOf(document.body).slice(0, 20000)))) {
+    const appliedBtn = qa('button, ukg-button, a.btn, [role="button"]').some((b) => !b.closest('#wdaf-host') && /^(you('ve| have) (already )?applied|applied|您已申请|您已经申请|已申请)$/i.test(textOf(b)));
+    if (QUEUE && oracleSubmitted()) {
+      running = false;
+      sessionStorage.removeItem(AUTO_KEY);
+      await addLog('已提交');
+      setStatus('🎉 已提交（Oracle 交完跳到 My Applications）');
+      qOut('submitted', 'Oracle 交完跳到 My Applications');
+      renderPanel();
+      return;
+    }
+    const oracleMyApps = /\/CandidateExperience\/.*\/my-profile\b/i.test(location.pathname) && /my applications/i.test(document.title);
+    if (QUEUE && (/[?&]status=alreadyApplied\b/i.test(location.search) || appliedBtn || oracleMyApps || /you('ve| have) already applied (for|to) this (job|position|role|opportunity)|您已申请(过)?(此|该|这个)?(职位|岗位)/i.test(textOf(document.body).slice(0, 20000)))) {
       running = false;
       sessionStorage.removeItem(AUTO_KEY);
       setStatus('这个职位以前已经投过（网站显示 already applied），不再填。');
@@ -5600,6 +5945,7 @@
         }
         if (isSignInPage()) {
           if (mailOtpFields().length) { await fillMailboxCode(); qOut('verify', '等邮箱验证码 / 等你确认验证'); break; }
+          if (await wdAutoSignIn()) { await sleep(1500); continue; }
           const reg = fillRegistration();
           setStatus(reg ? registrationStatus(reg) : '请用该网站已有的账号登录，登录后会自动继续…');
           if (await submitRegistration(reg)) { await sleep(1500); continue; }
@@ -5611,10 +5957,12 @@
         const step = currentStep();
         if (!step) {
           setStatus('等待申请表加载…');
+          if (QUEUE && QUEUE.url && /\/userHome\b/i.test(location.pathname) && !sessionStorage.getItem('wdaf-userHomeBack')) { sessionStorage.setItem('wdaf-userHomeBack', '1'); setStatus('登录后落到了 Candidate Home，回职位页'); location.assign(QUEUE.url); break; }
           const startSoon = () => ['autofillWithResume', 'applyManually', 'adventureButton'].some((id) => isVisible(q(`[data-automation-id="${id}"]`)));
           if (!(await waitFor(() => currentStep() || isSignInPage() || startSoon(), 15000, 500))) {
             const body = textOf(document.body).slice(0, 6000);
-            if (QUEUE && Q_CLOSED_RE.test(body)) { qOut('closed', '职位已关闭：' + body.match(Q_CLOSED_RE)[0]); break; }
+            const closedHit = QUEUE && qClosedHit(body);
+            if (closedHit) { qOut('closed', '职位已关闭：' + closedHit); break; }
             if (QUEUE && Q_DUP_RE.test(body)) { qOut('dup', '页面说已经投过'); break; }
             setStatus('没找到申请表。请先打开职位页或申请页。');
             break;
@@ -5701,7 +6049,8 @@
     if (!(appDetected || isWD())) return;
     const b = e.target.closest && e.target.closest('button, input[type="submit"], [role="button"]');
     if (!b) return;
-    if (!registrationForm() && !mailOtpFields().length && (isWD() ? /^submit( application)?$/i.test(textOf(b)) && /review/i.test(currentStep()) : SUBMIT_RE.test(buttonText(b)))) addLog(QUEUE ? '已点提交' : '已提交');
+    const applyEntry = /^(apply|apply now)$/i.test(buttonText(b)) && qa('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]), textarea, select').filter((i) => isVisible(i) && i.value && !i.closest('#wdaf-host')).length < 3;
+    if (!registrationForm() && !mailOtpFields().length && (isWD() ? /^submit( application)?$/i.test(textOf(b)) && /review/i.test(currentStep()) : SUBMIT_RE.test(buttonText(b)) && !applyEntry) && !isSignInPage()) { submitClickSave(); addLog('已点提交'); } // 登录页上的按钮不算（Ross 的 SuccessFactors 登录页 10-21 被记成点了提交）
     if (!running && pending.length && b === findNextButton()) saveLearned(collectLearned());
   }, true);
 
@@ -6029,8 +6378,8 @@
     if (ATS_HOST) return true;
     const hay = (location.href + ' ' + document.title).toLowerCase();
     const jobby = /apply|application|career|job|recruit|talent|candidate|hiring|greenhouse|lever|icims|taleo|jobvite|talemetry|smartrecruiters|ashby|workable|successfactors|oraclecloud|bamboohr|jazzhr|breezy|recruitee|teamtailor|eightfold|phenom|avature|paradox/.test(hay);
-    const hasEmail = vis.some((e) => e.type === 'email' || /e-?mail/i.test([e.name, e.id, e.placeholder, e.getAttribute('autocomplete'), e.getAttribute('aria-label'), ...[...(e.labels || [])].map((l) => l.textContent)].join(' ')));
-    const hasResume = vis.some((e) => e.type === 'file') && /resume|\bcv\b/i.test(textOf(document.body).slice(0, 50000));
+    const hasEmail = vis.some((e) => e.type === 'email' || /e-?mail|电子邮件|邮箱/i.test([e.name, e.id, e.placeholder, e.getAttribute('autocomplete'), e.getAttribute('aria-label'), ...[...(e.labels || [])].map((l) => l.textContent)].join(' ')));
+    const hasResume = vis.some((e) => e.type === 'file') && /resume|\bcv\b|简历|履历/i.test(textOf(document.body).slice(0, 50000));
     return (jobby && (hasEmail || hasResume)) || (hasEmail && hasResume);
   }
 
@@ -6145,7 +6494,7 @@
 
   const ATS_HOST = (/(^|\.)(paradox\.ai|applytojob\.com|paylocity\.com)$/i.test(location.hostname) && !/\/recruiting\/jobs\/details\//i.test(location.pathname))
     || (/(^|\.)myapps\.paychex\.com$/i.test(location.hostname) && /\/appone\//i.test(location.pathname));
-  const APPLY_URL_RE = /\/apply(\/|$|\?)|\/application(s)?\b|job_app|\/candidate\/|\/appone\/|\/onboardingform\//i;
+  const APPLY_URL_RE = /\/apply(\/|$|\?)|\/application(s)?\b|job_app|\/candidate\/|\/appone\/|\/onboardingform\/|\/jobs\/\d+\/[^/]+\/(candidate|questions|eeo|disability|veteran|review)\b|\/OpportunityApply\b/i;
   const maybeApplication = () => !isTrackerFrame() && (isWD() || ATS_HOST || isSfXweb() || isGoogleForm() || !!registrationForm() || mailOtpFields().length > 0 || (isSR() && /\/oneclick-ui\//.test(location.pathname)) || APPLY_URL_RE.test(location.pathname + location.search) || /\/CandidateExperience\/.*\/(easy-)?apply(\/|$)/i.test(location.pathname) || (qa('input[type="email"], input[type="file"], input[name*="mail" i], input[id*="mail" i], input[autocomplete="email"], input[placeholder*="mail" i]').some((i) => !isSubscribeForm(i.closest('form')) && !JOB_ALERT_FIELD_RE.test(`${i.id || ''} ${i.name || ''}`)) && looksLikeApplication())); // 职位页上订阅职位提醒的邮箱框（Barclays）不算申请表
 
   async function onDetected() {
@@ -6156,7 +6505,7 @@
       setTimeout(() => { if (!proxied) { awaitingAck = false; renderPanel(); } }, 3500);
     }
     await refreshPick();
-    if (sessionStorage.getItem(AUTO_KEY) && /application (has been |was )?(submitted|received)|thank you for (applying|your application|submitting)|successfully (applied|submitted)/i.test(textOf(document.body).slice(0, 20000))) sessionStorage.removeItem(AUTO_KEY);
+    if (sessionStorage.getItem(AUTO_KEY) && /application (has been |was )?(submitted|received)|thank you for (applying|your (job )?application|submitting)|successfully (applied|submitted)/i.test(textOf(document.body).slice(0, 20000))) sessionStorage.removeItem(AUTO_KEY);
     if (sessionStorage.getItem(AUTO_KEY)) {
       sessionStorage.removeItem(AUTO_KEY);
       setStatus('继续自动流程…');
@@ -6264,8 +6613,7 @@
     if (reg) setStatus(registrationStatus(reg));
     try {
       if (document.prerendering) throw new Error('prerender');
-      const r = await new Promise((res) => { setTimeout(() => res(null), 2000); chrome.runtime.sendMessage({ type: 'queueHello' }, (x) => { void chrome.runtime.lastError; res(x); }); });
-      if (r && r.item) { QUEUE = r.item; QUEUE_SUBMIT = !!r.autoSubmit; dbg('批量队列任务', QUEUE); }
+      await queueHello();
     } catch (_) { /* 测试页 / 插件断开 */ }
     if (!IN_FRAME) for (const f of qa('iframe')) { try { f.contentWindow.postMessage({ __wdaf: 'cmd', cmd: 'ping' }, '*'); } catch (_) { /* ignore */ } }
     if (maybeApplication()) onDetected();
